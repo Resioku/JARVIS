@@ -1,0 +1,13 @@
+Pillow
+PyQt6
+edge-tts
+faster-whisper
+google-generativeai
+keyboard
+miniaudio
+mouse
+numpy
+openwakeword
+pywin32
+sounddevice
+jellyfish

@@ -1,0 +1,6 @@
+keys.env
+jarvis.log
+__pycache__/
+_cache/
+icons/
+*.json

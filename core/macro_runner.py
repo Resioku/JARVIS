@@ -15,9 +15,11 @@ triggers go through _on_trigger / _on_release below.
 import atexit
 import ctypes
 import logging
+import threading
 
 from PyQt6.QtCore import QThread
 
+import settings
 from core.input_hub import get_hub
 from core.macro_steps import STEPS, RunContext, normalize, release_held
 from core.macro_store import load_macros
@@ -185,6 +187,16 @@ def _on_release(name):
         stop_macro_by_name(name)
 
 
+def _start_passthrough():
+    from core import virtual_pad
+    try:
+        virtual_pad.start_passthrough()
+    except virtual_pad.PadUnavailable as e:
+        log.error("Controller passthrough couldn't start: %s", e)
+    except Exception:
+        log.exception("Controller passthrough couldn't start")
+
+
 def register_hotkeys():
     """Re-binds every enabled macro's trigger. Call after any macro is added,
     edited, deleted or enabled/disabled, and once at startup."""
@@ -193,3 +205,6 @@ def register_hotkeys():
     hub.on_macro_release = _on_release
     hub.set_triggers([(m["hotkey"], m["name"]) for m in load_macros() if m.get("hotkey") and m.get("enabled", True)])
     hub.start()
+    if getattr(settings, "PAD_PASSTHROUGH", False):
+        # done on a worker thread: creating the virtual controller takes a moment
+        threading.Thread(target=_start_passthrough, daemon=True, name="pad-passthrough-start").start()

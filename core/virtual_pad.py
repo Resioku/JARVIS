@@ -1,8 +1,22 @@
 """
-Controller OUTPUT for macros: a virtual Xbox 360 controller that games see as
-a real pad. Needs the `vgamepad` package (pip install vgamepad), which sets up
-the ViGEmBus driver on Windows. Created lazily the first time a controller
-step runs, so nothing here costs anything if you never use one.
+Controller OUTPUT for macros, through a virtual Xbox 360 controller
+(`vgamepad` package + the ViGEmBus driver).
+
+IMPORTANT - why this exists the way it does: keyboard and mouse have one
+shared input stream that any program can add to, which is why keyboard/mouse
+macros "just work". Controllers don't: each pad is its own device and Windows
+has no way to add presses to a real one. So macros press buttons on a
+VIRTUAL controller, and a game only sees them if it is reading that virtual
+controller.
+
+Two modes:
+  - Normal: the virtual controller only carries macro presses. Works for games
+    that listen to every controller, or when no real controller is plugged in.
+  - Passthrough (settings.PAD_PASSTHROUGH = True): the virtual controller ALSO
+    mirrors your real controller (sticks, triggers, buttons), with macro
+    presses added on top. Hide the real controller from the game with HidHide
+    and the game plays through the virtual one: your real inputs and your
+    macros arrive together, as if it were one controller.
 
 Button names: a b x y lb rb lt rt back start ls rs up down left right guide
 """
@@ -14,6 +28,14 @@ import time
 log = logging.getLogger(__name__)
 
 BUTTON_NAMES = ["a", "b", "x", "y", "lb", "rb", "lt", "rt", "back", "start", "ls", "rs", "up", "down", "left", "right", "guide"]
+FORWARD_SLEEP = 0.004          # passthrough polls the real controller about 250 times a second
+
+# the standard XInput button bits (the same values vgamepad uses)
+MASKS = {
+    "up": 0x0001, "down": 0x0002, "left": 0x0004, "right": 0x0008, "start": 0x0010, "back": 0x0020,
+    "ls": 0x0040, "rs": 0x0080, "lb": 0x0100, "rb": 0x0200, "guide": 0x0400,
+    "a": 0x1000, "b": 0x2000, "x": 0x4000, "y": 0x8000,
+}
 
 
 class PadUnavailable(RuntimeError):
@@ -22,6 +44,8 @@ class PadUnavailable(RuntimeError):
 
 _pad = None
 _lock = threading.Lock()
+_forwarding = False
+_forward_stop = threading.Event()
 
 
 def available() -> bool:
@@ -29,44 +53,68 @@ def available() -> bool:
     return importlib.util.find_spec("vgamepad") is not None
 
 
+def _short(value):
+    return int(max(-1.0, min(1.0, float(value))) * 32767)
+
+
 class _Pad:
+    """The virtual controller. Its output is always: real controller (when passing through)
+    combined with whatever macros are currently holding."""
+
     def __init__(self, vg):
         self.gp = vg.VX360Gamepad()
-        b = vg.XUSB_BUTTON
-        self.buttons = {
-            "a": b.XUSB_GAMEPAD_A, "b": b.XUSB_GAMEPAD_B, "x": b.XUSB_GAMEPAD_X, "y": b.XUSB_GAMEPAD_Y,
-            "lb": b.XUSB_GAMEPAD_LEFT_SHOULDER, "rb": b.XUSB_GAMEPAD_RIGHT_SHOULDER,
-            "back": b.XUSB_GAMEPAD_BACK, "start": b.XUSB_GAMEPAD_START,
-            "ls": b.XUSB_GAMEPAD_LEFT_THUMB, "rs": b.XUSB_GAMEPAD_RIGHT_THUMB,
-            "up": b.XUSB_GAMEPAD_DPAD_UP, "down": b.XUSB_GAMEPAD_DPAD_DOWN,
-            "left": b.XUSB_GAMEPAD_DPAD_LEFT, "right": b.XUSB_GAMEPAD_DPAD_RIGHT,
-            "guide": b.XUSB_GAMEPAD_GUIDE,
-        }
+        self.lock = threading.RLock()
+        self.buttons = set()                              # held by macros
+        self.sticks = {"left": (0.0, 0.0), "right": (0.0, 0.0)}
+        self.real = None                                  # (buttons, lt, rt, lx, ly, rx, ry) of the real pad, or None
+        self._last = None
+
+    def set_real(self, real):
+        with self.lock:
+            self.real = real
+            self._send()
+
+    def _send(self):
+        with self.lock:
+            buttons, lt, rt, lx, ly, rx, ry = self.real or (0, 0, 0, 0, 0, 0, 0)
+            for name in self.buttons:
+                if name == "lt":
+                    lt = 255
+                elif name == "rt":
+                    rt = 255
+                else:
+                    buttons |= MASKS[name]
+            sx, sy = self.sticks["left"]
+            if sx or sy:                                   # a macro tilting a stick wins over the real stick
+                lx, ly = _short(sx), _short(sy)
+            sx, sy = self.sticks["right"]
+            if sx or sy:
+                rx, ry = _short(sx), _short(sy)
+            packet = (buttons, lt, rt, lx, ly, rx, ry)
+            if packet == self._last:
+                return
+            self._last = packet
+            rep = self.gp.report
+            rep.wButtons, rep.bLeftTrigger, rep.bRightTrigger = buttons, lt, rt
+            rep.sThumbLX, rep.sThumbLY, rep.sThumbRX, rep.sThumbRY = lx, ly, rx, ry
+            self.gp.update()
 
     def press(self, name):
-        if name == "lt":
-            self.gp.left_trigger_float(value_float=1.0)
-        elif name == "rt":
-            self.gp.right_trigger_float(value_float=1.0)
-        else:
-            self.gp.press_button(button=self.buttons[name])
-        self.gp.update()
+        if name not in MASKS and name not in ("lt", "rt"):
+            raise PadUnavailable(f"Unknown controller button '{name}'")
+        with self.lock:
+            self.buttons.add(name)
+            self._send()
 
     def release(self, name):
-        if name == "lt":
-            self.gp.left_trigger_float(value_float=0.0)
-        elif name == "rt":
-            self.gp.right_trigger_float(value_float=0.0)
-        else:
-            self.gp.release_button(button=self.buttons[name])
-        self.gp.update()
+        with self.lock:
+            self.buttons.discard(name)
+            self._send()
 
     def stick(self, which, x, y):
-        if which == "left":
-            self.gp.left_joystick_float(x_value_float=x, y_value_float=y)
-        else:
-            self.gp.right_joystick_float(x_value_float=x, y_value_float=y)
-        self.gp.update()
+        with self.lock:
+            self.sticks[which] = (float(x), float(y))
+            self._send()
 
 
 def _get():
@@ -106,3 +154,45 @@ def release(name):
 
 def stick(which, x, y):
     _get().stick(which, x, y)
+
+
+# ---------- Passthrough ----------
+
+def _forward_loop(pad):
+    import ctypes
+    from core.input_hub import _XState, _load_xinput, get_hub
+    xinput = _load_xinput()
+    if xinput is None:
+        log.error("Passthrough needs XInput (Windows)")
+        return
+    hub = get_hub()
+    state = _XState()
+    log.info("Controller passthrough is ON: your real controller is mirrored through the virtual one")
+    last_slot = None
+    while not _forward_stop.is_set():
+        try:
+            real = None
+            candidates = [i for i in hub.connected_slots() if i not in hub.ignore_slots]
+            if candidates and xinput.XInputGetState(candidates[0], ctypes.byref(state)) == 0:
+                g = state.Gamepad
+                real = (g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY)
+                if candidates[0] != last_slot:
+                    last_slot = candidates[0]
+                    log.info("Passthrough is mirroring the real controller in XInput slot %d", last_slot)
+            pad.set_real(real)
+        except Exception:
+            log.exception("Passthrough error")
+            time.sleep(1)
+        time.sleep(FORWARD_SLEEP)
+
+
+def start_passthrough():
+    """Creates the virtual controller now and starts mirroring the real one through it.
+    Safe to call repeatedly."""
+    global _forwarding
+    if _forwarding:
+        return
+    pad = _get()                       # raises PadUnavailable with a clear message if it can't
+    _forwarding = True
+    _forward_stop.clear()
+    threading.Thread(target=_forward_loop, args=(pad,), daemon=True, name="pad-passthrough").start()

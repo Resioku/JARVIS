@@ -1,19 +1,17 @@
 """
-One listener for ALL macro triggers: keyboard keys (with numpad keys kept
-separate from the top-row digits) and XInput controllers (Xbox pads, or
-anything Steam Input / DS4Windows presents as one).
+One listener for ALL macro triggers and for recording: keyboard keys (numpad
+kept separate from the top-row digits), mouse buttons, and XInput controllers
+(Xbox pads, or anything Steam Input / DS4Windows presents as one).
 
 Every input becomes a text "token":
     keyboard:    "x", "f5", "ctrl", "num 1", "num add", "num enter"
+    mouse:       "mouse:left", "mouse:right", "mouse:middle", "mouse:x", "mouse:x2"
     controller:  "pad:a", "pad:rb", "pad:lt", "pad:up", "pad:start" ...
-A trigger is tokens joined with "+", e.g. "x", "ctrl+num 1", "pad:lb+pad:a".
-A trigger fires when EXACTLY those tokens are held (so "x" does not fire
-on ctrl+x). Keyboard and controller tokens can be mixed in one trigger.
+A trigger is tokens joined with "+", e.g. "x", "ctrl+num 1", "pad:lb+pad:a",
+"mouse:x2". It fires when EXACTLY those tokens are held, and ends when any of
+them is let go (that end is what "loop while held" macros listen for).
 
-Why this replaces keyboard.add_hotkey(): that library names keypad digits
-the same as top-row digits ("num 1" silently becomes "1"), so a numpad
-hotkey can't be told apart from the top-row key. Here numpad keys get their
-own tokens, and every registration and every fire is written to jarvis.log.
+Everything that happens is written to jarvis.log (registrations, fires).
 """
 import ctypes
 import logging
@@ -21,7 +19,7 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, pyqtSignal, pyqtSlot
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +36,7 @@ _KEYPAD_NAMES = {
     ".": "decimal", "decimal": "decimal", "separator": "decimal",
 }
 _ALIASES = {"num plus": "num add", "num minus": "num sub", "num subtract": "num sub"}
+_MOUSE_BUTTONS = ("left", "right", "middle", "x", "x2")
 
 _PAD_BUTTONS = [
     (0x0001, "pad:up"), (0x0002, "pad:down"), (0x0004, "pad:left"), (0x0008, "pad:right"),
@@ -54,7 +53,7 @@ def norm_token(name):
     name = (name or "").strip().lower()
     if not name:
         return None
-    if name.startswith("pad:"):
+    if name.startswith(("pad:", "mouse:")):
         return name
     if name.startswith("num ") and name != "num lock":
         return _ALIASES.get(name, name)
@@ -122,18 +121,28 @@ def _load_xinput():
 
 class InputHub(QObject):
     _fire = pyqtSignal(str)       # worker thread -> GUI thread (queued automatically)
+    _unfire = pyqtSignal(str)
     captured = pyqtSignal(str)    # a finished capture; "" means cancelled/cleared (Esc)
 
     def __init__(self):
         super().__init__()
-        self.on_macro = None       # set by core/macro_runner.py: called on the GUI thread with a macro name
+        self.on_macro = None           # called on the GUI thread with a macro name when its trigger goes down
+        self.on_macro_release = None   # ...and when its trigger is let go
+        self.ignore_slots = set()      # XInput slots to ignore (our own virtual controller)
         self._lock = threading.Lock()
-        self._held = []            # tokens currently down, in press order
-        self._triggers = {}        # frozenset(tokens) -> macro name
+        self._held = []                # tokens currently down, in press order
+        self._triggers = {}            # frozenset(tokens) -> macro name
+        self._active = {}              # triggers currently held down
         self._capturing = False
+        self._allow_esc = False
+        self._muted = False
         self._peak = []
+        self._raw = []                 # recorder callbacks: fn(token, is_down, time)
+        self._connected = [False] * 4
+        self._next_probe = [0.0] * 4
         self._started = False
         self._fire.connect(self._dispatch)
+        self._unfire.connect(self._dispatch_release)
 
     # ---------- setup ----------
 
@@ -152,9 +161,10 @@ class InputHub(QObject):
             log.info("Hotkey registered: %r -> %r (tokens: %s)", text, name, sorted(combo))
         with self._lock:
             self._triggers = new
+            self._active = {}
 
     def start(self):
-        """Safe to call repeatedly. Starts the keyboard hook and controller poller once."""
+        """Safe to call repeatedly. Starts keyboard, mouse-button and controller listening once."""
         if self._started:
             return
         self._started = True
@@ -164,15 +174,43 @@ class InputHub(QObject):
             log.info("Keyboard hook installed")
         except Exception:
             log.exception("Couldn't install the keyboard hook, hotkeys won't work")
+        try:
+            import mouse
+            for button in _MOUSE_BUTTONS:
+                for kind in ("down", "up"):
+                    mouse.on_button(self._on_mouse, args=(button, kind), buttons=(button,), types=(kind,))
+            log.info("Mouse button hook installed")
+        except Exception:
+            log.exception("Couldn't install the mouse button hook, mouse triggers won't work")
         threading.Thread(target=self._controller_loop, daemon=True, name="pad-poll").start()
+
+    def set_muted(self, muted):
+        """While muted, nothing fires macros (used while recording)."""
+        with self._lock:
+            self._muted = muted
+
+    def add_raw_listener(self, fn):
+        self._raw.append(fn)
+
+    def remove_raw_listener(self, fn):
+        if fn in self._raw:
+            self._raw.remove(fn)
+
+    def connected_slots(self):
+        return [i for i, ok in enumerate(self._connected) if ok]
+
+    def probe_now(self):
+        """Look for newly plugged-in controllers right away instead of waiting."""
+        self._next_probe = [0.0] * 4
 
     # ---------- capture mode (used by the macro editor) ----------
 
-    def begin_capture(self):
+    def begin_capture(self, allow_esc=False):
         """Next key/button/combo you press and release is reported through `captured`.
-        Macros don't fire while capturing."""
+        Esc cancels (reported as "") unless allow_esc. Macros don't fire while capturing."""
         with self._lock:
             self._capturing = True
+            self._allow_esc = allow_esc
             self._peak = []
 
     def end_capture(self):
@@ -181,6 +219,13 @@ class InputHub(QObject):
             self._peak = []
 
     # ---------- core logic (also what the tests exercise) ----------
+
+    def _notify_raw(self, token, down):
+        for fn in list(self._raw):
+            try:
+                fn(token, down, time.monotonic())
+            except Exception:
+                log.exception("Input listener failed")
 
     def _press(self, token):
         name = None
@@ -193,26 +238,39 @@ class InputHub(QObject):
             if self._capturing:
                 if token not in self._peak:
                     self._peak.append(token)
-                return
-            name = self._triggers.get(frozenset(self._held))
+            elif not self._muted:
+                combo = frozenset(self._held)
+                name = self._triggers.get(combo)
+                if name:
+                    self._active[combo] = name
+        self._notify_raw(token, True)
         if name:
             log.info("Hotkey fired: %s -> %r", combo_text(self._held), name)
             self._fire.emit(name)
 
     def _release(self, token):
         result = None
+        ended = []
         with self._lock:
             if token in self._held:
                 self._held.remove(token)
+            held = set(self._held)
+            for combo, name in list(self._active.items()):
+                if not combo <= held:
+                    del self._active[combo]
+                    ended.append(name)
             if LOG_EVERY_INPUT:
                 log.info("input up: %s", token)
             if self._capturing and self._peak and not self._held:
                 result = combo_text(self._peak)
                 self._peak = []
                 self._capturing = False
+        self._notify_raw(token, False)
+        for name in ended:
+            self._unfire.emit(name)
         if result is not None:
             log.info("Captured: %r", result)
-            self.captured.emit("" if result == "esc" else result)
+            self.captured.emit("" if (result == "esc" and not self._allow_esc) else result)
 
     @pyqtSlot(str)
     def _dispatch(self, name):
@@ -221,6 +279,14 @@ class InputHub(QObject):
                 self.on_macro(name)
         except Exception:
             log.exception("Running macro %r from its trigger failed", name)
+
+    @pyqtSlot(str)
+    def _dispatch_release(self, name):
+        try:
+            if self.on_macro_release:
+                self.on_macro_release(name)
+        except Exception:
+            log.exception("Handling the release of %r's trigger failed", name)
 
     # ---------- input sources ----------
 
@@ -238,6 +304,16 @@ class InputHub(QObject):
         except Exception:
             log.exception("Error handling a key event")
 
+    def _on_mouse(self, button, kind):
+        try:
+            token = f"mouse:{button}"
+            if kind == "down":
+                self._press(token)
+            else:
+                self._release(token)
+        except Exception:
+            log.exception("Error handling a mouse event")
+
     def _controller_loop(self):
         xinput = _load_xinput()
         if xinput is None:
@@ -245,33 +321,33 @@ class InputHub(QObject):
             return
         log.info("Controller polling started (XInput)")
         held = [set() for _ in range(4)]
-        connected = [False] * 4
-        next_probe = [0.0] * 4
         state = _XState()
         while True:
             try:
                 now = time.monotonic()
                 for i in range(4):
-                    if not connected[i] and now < next_probe[i]:
+                    if not self._connected[i] and now < self._next_probe[i]:
                         continue
                     if xinput.XInputGetState(i, ctypes.byref(state)) != 0:
-                        if connected[i]:
+                        if self._connected[i]:
                             log.info("Controller %d disconnected", i)
-                        connected[i] = False
-                        next_probe[i] = now + PROBE_SECONDS
+                        self._connected[i] = False
+                        self._next_probe[i] = now + PROBE_SECONDS
                         for token in held[i]:
                             self._release(token)
                         held[i] = set()
                         continue
-                    if not connected[i]:
+                    if not self._connected[i]:
                         log.info("Controller %d connected", i)
-                    connected[i] = True
+                    self._connected[i] = True
                     pad = state.Gamepad
                     down = {tok for bit, tok in _PAD_BUTTONS if pad.wButtons & bit}
                     if pad.bLeftTrigger >= TRIGGER_THRESHOLD:
                         down.add("pad:lt")
                     if pad.bRightTrigger >= TRIGGER_THRESHOLD:
                         down.add("pad:rt")
+                    if i in self.ignore_slots:
+                        down = set()       # our own virtual controller must never trigger macros
                     for token in sorted(down - held[i]):
                         self._press(token)
                     for token in sorted(held[i] - down):
@@ -287,8 +363,13 @@ _hub = None
 
 
 def get_hub() -> InputHub:
-    """Create it on the GUI thread (main.py's register_hotkeys() call does)."""
+    """The one shared hub. register_hotkeys() in main.py creates it on the GUI thread at startup."""
     global _hub
     if _hub is None:
         _hub = InputHub()
+        # signals only reach the GUI thread if the hub lives there, even if some
+        # worker thread happened to be the first to ask for it
+        app = QCoreApplication.instance()
+        if app is not None and QThread.currentThread() is not app.thread():
+            _hub.moveToThread(app.thread())
     return _hub

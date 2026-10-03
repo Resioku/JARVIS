@@ -27,3 +27,5 @@ ACK_PHRASE = "Yes?"               # only spoken as a nudge if you stay silent â€
 SLOW_START_PROMPT_SECONDS = 1.0   # how long to wait quietly before nudging with the ack
 STARTUP_PHRASE = "Online and ready, sir."   # spoken when JARVIS starts. "" = stay quiet
 CANCEL_PHRASES = ["nevermind", "never mind", "cancel", "forget it"]   # only checked at the START of what you say
+
+PAD_PASSTHROUGH = True   # mirror your real controller through the virtual one, so macros and real inputs arrive together

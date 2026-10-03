@@ -1,20 +1,26 @@
 """
 SECTION: Macros
-Build a macro by hand: "+ Add input" taps a key or mouse button, "+ Hold for
-time" holds one for a set number of milliseconds, "+ Hold down" / "+ Release"
-hold something across other steps, and "+ Add wait" pauses. Optionally bind a
-trigger (a key, a key combo, or a controller button) and turn on "Loop until
-stopped" for something like an autoclicker. Every saved macro is also a
-voice command automatically.
+Build a macro from steps (keyboard, mouse and controller), give it a trigger
+(a key, a combo, a mouse button or a controller button), and choose how it
+runs: once, N times, loop until stopped, or loop while the trigger is held.
+
+Every kind of step is defined in core/macro_steps.py - the Add menu, the Edit
+dialog and the step list all read that table, so new step types show up here
+without touching this file.
 """
+import copy
+
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
-    QListWidget, QScrollArea, QInputDialog, QCheckBox
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QScrollArea, QInputDialog, QCheckBox, QDialog, QFormLayout, QSpinBox,
+    QDoubleSpinBox, QComboBox, QMenu, QDialogButtonBox, QAbstractItemView
 )
-from PyQt6.QtGui import QKeySequence
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 
 from core.macro_store import load_macros, save_macros
+from core.macro_steps import STEPS, describe, normalize, default_step, step_for_input
+from core.input_hub import get_hub, parse_combo
+from core.macro_recorder import MacroRecorder
 
 BTN_STYLE = """
 QPushButton {
@@ -23,70 +29,65 @@ QPushButton {
 }
 QPushButton:hover { background-color: #21262d; border-color: #00e5ff; }
 """
-STOP_BTN_STYLE = """
-QPushButton {
-    background-color: #161b22; color: #f85149; border: 1px solid #30363d;
-    border-radius: 8px; padding: 6px;
+STOP_BTN_STYLE = BTN_STYLE.replace("#c9d1d9", "#f85149").replace("#00e5ff", "#f85149")
+REC_BTN_STYLE = BTN_STYLE.replace("#c9d1d9", "#f85149")
+MENU_STYLE = """
+QMenu { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; }
+QMenu::item { padding: 6px 18px; }
+QMenu::item:selected { background-color: #21262d; color: #00e5ff; }
+QMenu::separator { height: 1px; background: #30363d; margin: 4px 0; }
+"""
+DIALOG_STYLE = """
+QDialog { background-color: #161b22; }
+QLabel { color: #c9d1d9; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 3px 6px;
 }
-QPushButton:hover { background-color: #21262d; border-color: #f85149; }
+"""
+LIST_STYLE = """
+QListWidget { background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; }
+QListWidget::item { padding: 4px 6px; }
+QListWidget::item:selected { background-color: #21262d; color: #00e5ff; }
 """
 
-MIN_WAIT_MS = 10   # matches core/macro_runner.py's built-in floor
+MODES = [
+    ("Run once", "once"),
+    ("Repeat a number of times", "repeat"),
+    ("Loop until stopped (trigger toggles it)", "toggle"),
+    ("Loop while the trigger is held", "hold"),
+]
+MODE_LABELS = {value: label for label, value in MODES}
 
-# translates Qt's key-name strings into the names the `keyboard` library expects
-QT_KEY_OVERRIDES = {
-    "Esc": "esc", "Return": "enter", "Enter": "enter", "Space": "space",
-    "Backspace": "backspace", "Delete": "delete", "Tab": "tab",
-    "Up": "up", "Down": "down", "Left": "left", "Right": "right",
-}
-
-MODIFIER_KEYS = {
-    Qt.Key.Key_Shift: "shift",
-    Qt.Key.Key_Control: "ctrl",
-    Qt.Key.Key_Alt: "alt",
-    Qt.Key.Key_Meta: "windows",
-}
-
-# numpad names used when a numpad key is captured as a STEP (the `keyboard`
-# library can only replay these as the matching digit/operator)
-NUMPAD_KEY_NAMES = {
-    Qt.Key.Key_0: "num 0", Qt.Key.Key_1: "num 1", Qt.Key.Key_2: "num 2",
-    Qt.Key.Key_3: "num 3", Qt.Key.Key_4: "num 4", Qt.Key.Key_5: "num 5",
-    Qt.Key.Key_6: "num 6", Qt.Key.Key_7: "num 7", Qt.Key.Key_8: "num 8",
-    Qt.Key.Key_9: "num 9", Qt.Key.Key_Plus: "num add", Qt.Key.Key_Minus: "num sub",
-    Qt.Key.Key_Asterisk: "num multiply", Qt.Key.Key_Slash: "num divide",
-    Qt.Key.Key_Enter: "num enter",
-}
-
+# starter templates: name -> (steps, mode)
 SAMPLES = {
-    "Blank": [],
-    "Autoclicker (10 clicks)": [{"type": "click"}, {"type": "wait", "ms": 200}] * 10,
-    "Copy && Paste (Ctrl+C / Ctrl+V)": [
-        {"type": "key", "key": "ctrl+c"},
-        {"type": "wait", "ms": 100},
-        {"type": "key", "key": "ctrl+v"},
-    ],
-    "Hold W for 2 seconds": [{"type": "hold", "key": "w", "ms": 2000}],
+    "Blank": ([], "once"),
+    "Autoclicker (runs while you hold the trigger)": (
+        [{"type": "click", "button": "left"}, {"type": "wait", "ms": 50, "rand": 0}], "hold"),
+    "Copy && Paste (Ctrl+C / Ctrl+V)": (
+        [{"type": "key", "key": "ctrl+c"}, {"type": "wait", "ms": 100, "rand": 0}, {"type": "key", "key": "ctrl+v"}], "once"),
+    "Hold W for 2 seconds": ([{"type": "keyhold", "key": "w", "ms": 2000}], "once"),
+    "Controller: spam A": (
+        [{"type": "pad", "button": "a"}, {"type": "wait", "ms": 100, "rand": 0}], "toggle"),
 }
 
 CAPTURE_HINTS = {
-    "tap": "Press any key or click any mouse button (hold Shift/Ctrl/Alt for a combo, Esc cancels)...",
-    "hold": "Press the key or button to HOLD (you'll set how long next, Esc cancels)...",
-    "down": "Press the key or button to HOLD DOWN until a Release step (Esc cancels)...",
-    "up": "Press the key or button to RELEASE (Esc cancels)...",
+    "tap": "Press a key, mouse button or controller button to TAP (Esc cancels)...",
+    "hold": "Press the key, mouse button or controller button to HOLD for a set time (Esc cancels)...",
+    "down": "Press the input to HOLD DOWN until a Release step (Esc cancels)...",
+    "up": "Press the input you want to RELEASE (Esc cancels)...",
 }
+TEST_NAME = "(test run)"
 
 
-def _qt_key_to_name(qt_key: int) -> str:
-    raw = QKeySequence(qt_key).toString()
-    return QT_KEY_OVERRIDES.get(raw, raw.lower())
+def _mode_of(macro):
+    mode = (macro or {}).get("mode")
+    if mode in MODE_LABELS:
+        return mode
+    return "toggle" if (macro or {}).get("loop") else "once"
 
 
-def _resolve_key_name(qt_key: int, modifiers) -> str:
-    """Like _qt_key_to_name, but checks for the numpad modifier first."""
-    if modifiers & Qt.KeyboardModifier.KeypadModifier and qt_key in NUMPAD_KEY_NAMES:
-        return NUMPAD_KEY_NAMES[qt_key]
-    return _qt_key_to_name(qt_key)
+def _trigger_text(macro):
+    return f"  [{macro['hotkey']}]" if macro.get("hotkey") else ""
 
 
 # ---------- Section contract ----------
@@ -100,9 +101,7 @@ def create_widget(nav):
 # ---------- Widgets ----------
 
 class MacroList(QWidget):
-    # a wider panel for this page so the list and its Run/Edit/Delete
-    # buttons have room to breathe - Panel reads this automatically
-    PANEL_SIZE = (560, 460)
+    PANEL_SIZE = (640, 480)
 
     def __init__(self, nav):
         super().__init__()
@@ -112,8 +111,8 @@ class MacroList(QWidget):
         layout = QVBoxLayout(self)
 
         hint = QLabel(
-            'Voice: say a macro\'s name - "Hey Jarvis, run <name>". '
-            'For a looping macro, say "stop" (or "stop <name>") to end it.'
+            'Voice: "Hey Jarvis, run <name>". Say "stop" to end running macros. '
+            "Untick a macro to disable its trigger and voice command without deleting it."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8b949e;")
@@ -121,6 +120,7 @@ class MacroList(QWidget):
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(self.scroll)
 
@@ -129,16 +129,23 @@ class MacroList(QWidget):
         self.list_layout.setSpacing(6)
         self.scroll.setWidget(self.list_container)
 
+        bottom = QHBoxLayout()
         new_btn = QPushButton("+ New macro")
         new_btn.setStyleSheet(BTN_STYLE)
         new_btn.clicked.connect(self.new_macro)
-        layout.addWidget(new_btn)
+        bottom.addWidget(new_btn)
+        stop_btn = QPushButton("Stop all")
+        stop_btn.setStyleSheet(STOP_BTN_STYLE)
+        stop_btn.clicked.connect(self.stop_all)
+        bottom.addWidget(stop_btn)
+        layout.addLayout(bottom)
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #d29922;")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        # keeps Run/Stop button labels in sync if a loop is toggled via hotkey or voice
+        # keeps Run/Stop button labels in sync if a macro is started/stopped by trigger or voice
         self._label_timer = QTimer(self)
         self._label_timer.timeout.connect(self._refresh_run_labels)
         self._label_timer.start(1000)
@@ -160,7 +167,6 @@ class MacroList(QWidget):
         else:
             for macro in macros:
                 self.list_layout.addWidget(self._build_row(macro))
-
         self.list_layout.addStretch()
 
     def _build_row(self, macro):
@@ -168,13 +174,16 @@ class MacroList(QWidget):
         row = QHBoxLayout(row_widget)
         row.setContentsMargins(0, 0, 0, 0)
 
-        label_text = macro["name"]
-        if macro.get("hotkey"):
-            label_text += f"  [{macro['hotkey']}]"
-        if macro.get("loop"):
-            label_text += "  (loop)"
-        label = QLabel(label_text)
-        label.setStyleSheet("color: #c9d1d9;")
+        enabled = QCheckBox()
+        enabled.setChecked(macro.get("enabled", True))
+        enabled.setToolTip("Enabled")
+        enabled.toggled.connect(lambda checked, m=macro: self.set_enabled(m, checked))
+        row.addWidget(enabled)
+
+        mode = _mode_of(macro)
+        suffix = {"once": "", "repeat": f"  (x{macro.get('repeat', 1)})", "toggle": "  (loop)", "hold": "  (hold)"}[mode]
+        label = QLabel(macro["name"] + _trigger_text(macro) + suffix)
+        label.setStyleSheet("color: #c9d1d9;" if macro.get("enabled", True) else "color: #4d5560;")
         row.addWidget(label, 1)
 
         run_btn = QPushButton()
@@ -182,15 +191,11 @@ class MacroList(QWidget):
         row.addWidget(run_btn)
         self._run_buttons[macro["name"]] = run_btn
 
-        edit_btn = QPushButton("Edit")
-        edit_btn.setStyleSheet(BTN_STYLE)
-        edit_btn.clicked.connect(lambda checked, m=macro: self.edit_macro(m))
-        row.addWidget(edit_btn)
-
-        del_btn = QPushButton("Delete")
-        del_btn.setStyleSheet(BTN_STYLE)
-        del_btn.clicked.connect(lambda checked, m=macro: self.delete_macro(m))
-        row.addWidget(del_btn)
+        for text, handler in (("Edit", self.edit_macro), ("Copy", self.duplicate_macro), ("Delete", self.delete_macro)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BTN_STYLE)
+            btn.clicked.connect(lambda checked, m=macro, h=handler: h(m))
+            row.addWidget(btn)
 
         self._style_run_button(macro, run_btn)
         return row_widget
@@ -198,7 +203,7 @@ class MacroList(QWidget):
     def _style_run_button(self, macro, btn):
         try:
             from core.macro_runner import is_running
-            running = macro.get("loop") and is_running(macro["name"])
+            running = is_running(macro["name"])
         except ImportError:
             running = False
         btn.setText("Stop" if running else "Run")
@@ -211,21 +216,50 @@ class MacroList(QWidget):
                 self._style_run_button(macros[name], btn)
 
     def new_macro(self):
-        choice, ok = QInputDialog.getItem(
-            self, "New Macro", "Start from:", list(SAMPLES.keys()), 0, False
-        )
+        choice, ok = QInputDialog.getItem(self, "New Macro", "Start from:", list(SAMPLES.keys()), 0, False)
         if not ok:
             return
-        starter_steps = [dict(s) for s in SAMPLES[choice]]
-        self.nav.push(MacroEditor(self.nav, None, starter_steps, self.refresh), "New Macro")
+        steps, mode = SAMPLES[choice]
+        self.nav.push(MacroEditor(self.nav, None, [dict(s) for s in steps], self.refresh, mode), "New Macro")
 
     def edit_macro(self, macro):
         self.nav.push(MacroEditor(self.nav, macro, list(macro["steps"]), self.refresh), macro["name"])
+
+    def set_enabled(self, macro, checked):
+        macros = load_macros()
+        for m in macros:
+            if m["name"] == macro["name"]:
+                m["enabled"] = checked
+        save_macros(macros)
+        self._reregister_hotkeys()
+        self.refresh()
+
+    def duplicate_macro(self, macro):
+        macros = load_macros()
+        names = {m["name"] for m in macros}
+        new_name, n = f"{macro['name']} copy", 2
+        while new_name in names:
+            new_name, n = f"{macro['name']} copy {n}", n + 1
+        clone = copy.deepcopy(macro)
+        clone["name"], clone["hotkey"] = new_name, None      # no trigger, so it can't clash with the original
+        index = next(i for i, m in enumerate(macros) if m["name"] == macro["name"])
+        macros.insert(index + 1, clone)
+        save_macros(macros)
+        self.refresh()
 
     def delete_macro(self, macro):
         save_macros([m for m in load_macros() if m["name"] != macro["name"]])
         self._reregister_hotkeys()
         self.refresh()
+
+    def stop_all(self):
+        try:
+            from core.macro_runner import stop_all
+            stop_all()
+            self.status_label.setText("Stopped everything.")
+            self._refresh_run_labels()
+        except ImportError:
+            pass
 
     def run_macro(self, macro):
         try:
@@ -234,8 +268,8 @@ class MacroList(QWidget):
             self.status_label.setText("Install requirements.txt first (`keyboard`/`mouse` missing).")
             return
 
-        # stopping a loop is instant - no need to wait or switch windows for that
-        if macro.get("loop") and is_running(macro["name"]):
+        # stopping is instant - no need to wait or switch windows for that
+        if is_running(macro["name"]):
             self.status_label.setText(trigger_macro(macro))
             self._refresh_run_labels()
             return
@@ -256,277 +290,460 @@ class MacroList(QWidget):
             pass
 
 
+class StepDialog(QDialog):
+    """Add/Edit dialog for any step type. The form is built from the step's
+    field list in core/macro_steps.py, so it never needs changing for new steps."""
+
+    def __init__(self, parent, hub, step_type, step=None):
+        super().__init__(parent)
+        self.hub = hub
+        self.step_type = step_type
+        self._cap_field = None
+        spec = STEPS[step_type]
+        self.setWindowTitle((spec["menu"] or step_type).rstrip("."))
+        self.setStyleSheet(DIALOG_STYLE)
+        self.setMinimumWidth(380)
+        step = step or default_step(step_type)
+
+        form = QFormLayout()
+        self.widgets = {}
+        for key, label, kind, default, extra in spec["fields"]:
+            value = step.get(key, default)
+            if kind in ("key", "pad"):
+                edit = QLineEdit(str(value))
+                capture = QPushButton("Capture")
+                capture.setStyleSheet(BTN_STYLE)
+                capture.clicked.connect(lambda checked=False, k=key: self._capture(k))
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(edit, 1)
+                h.addWidget(capture)
+                form.addRow(label, row)
+                self.widgets[key] = (kind, edit)
+            elif kind == "text":
+                edit = QLineEdit(str(value))
+                form.addRow(label, edit)
+                self.widgets[key] = (kind, edit)
+            elif kind == "int":
+                spin = QSpinBox()
+                spin.setRange(*extra)
+                spin.setValue(int(value))
+                form.addRow(label, spin)
+                self.widgets[key] = (kind, spin)
+            elif kind == "float":
+                spin = QDoubleSpinBox()
+                spin.setRange(*extra)
+                spin.setDecimals(2)
+                spin.setSingleStep(0.1)
+                spin.setValue(float(value))
+                form.addRow(label, spin)
+                self.widgets[key] = (kind, spin)
+            elif kind == "choice":
+                combo = QComboBox()
+                combo.addItems(extra)
+                combo.setCurrentText(str(value))
+                form.addRow(label, combo)
+                self.widgets[key] = (kind, combo)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        if spec.get("pick_xy"):
+            pick = QPushButton("Pick position by clicking on the screen")
+            pick.setStyleSheet(BTN_STYLE)
+            pick.clicked.connect(lambda: self._capture("__pos__"))
+            layout.addWidget(pick)
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color: #d29922;")
+        layout.addWidget(self.note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        hub.captured.connect(self._on_captured)
+
+    def _capture(self, field):
+        self._cap_field = field
+        self.note.setText("Click anywhere on the screen (Esc cancels)..." if field == "__pos__"
+                          else "Press the key or button now (Esc cancels)...")
+        self.hub.start()
+        self.hub.begin_capture()
+
+    def _on_captured(self, text):
+        field, self._cap_field = self._cap_field, None
+        if field is None:
+            return
+        self.note.setText("")
+        if not text:
+            return
+        if field == "__pos__":
+            if text == "mouse:left":
+                import mouse
+                x, y = mouse.get_position()
+                self.widgets["x"][1].setValue(x)
+                self.widgets["y"][1].setValue(y)
+            else:
+                self.note.setText("That wasn't a left click. Try again.")
+            return
+        kind, edit = self.widgets[field]
+        tokens = [t for t in text.split("+") if t]
+        if kind == "key":
+            picked = [t for t in tokens if not t.startswith(("pad:", "mouse:"))]
+        else:
+            picked = [t[4:] for t in tokens if t.startswith("pad:")]
+        if picked:
+            edit.setText("+".join(picked))
+        else:
+            self.note.setText("That was the wrong kind of input for this field.")
+
+    def done(self, result):
+        self.hub.end_capture()
+        super().done(result)
+
+    def values(self):
+        step = {"type": self.step_type}
+        for key, (kind, widget) in self.widgets.items():
+            if kind in ("key", "pad", "text"):
+                step[key] = widget.text() if kind == "text" else widget.text().strip()
+            elif kind == "int":
+                step[key] = widget.value()
+            elif kind == "float":
+                step[key] = round(widget.value(), 2)
+            else:
+                step[key] = widget.currentText()
+        return step
+
+
 class MacroEditor(QWidget):
-    """Add key/click/hold/wait steps, optionally set a trigger and loop, then save."""
+    PANEL_SIZE = (640, 600)
 
-    PANEL_SIZE = (560, 460)
-    _mouse_captured = pyqtSignal(str)   # emitted from the `mouse` library's own thread; Qt queues it safely to this widget's thread
-
-    def __init__(self, nav, macro, starter_steps, on_saved):
+    def __init__(self, nav, macro, starter_steps, on_saved, starter_mode="once"):
         super().__init__()
         self.nav = nav
         self.on_saved = on_saved
+        self.macro = macro
         self.original_name = macro["name"] if macro else None
-        self.steps = starter_steps
         self.hotkey = macro.get("hotkey") if macro else None
-        self._listening_input = False
-        self._capture_mode = "tap"       # tap / hold / down / up - what the next captured input becomes
-        self._held_modifiers = []
-        self._mouse_handlers = []
+        self._cap_target = None            # what the next hub capture is for: ("trigger",) or ("step", action)
+        self._pending_test = None
 
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._mouse_captured.connect(self._on_mouse_captured)
-
-        # triggers (keys, combos, controller buttons) are captured by the input hub,
-        # which sees exactly what will later fire the macro
-        from core.input_hub import get_hub
         self._hub = get_hub()
-        self._hub.captured.connect(self._on_hotkey_captured)
-        self.destroyed.connect(lambda *_, hub=self._hub: hub.end_capture())
+        self._hub.captured.connect(self._on_captured)
+        self._recorder = MacroRecorder(self._hub)
+        self._recorder.finished.connect(self._on_recorded)
+        self.destroyed.connect(lambda *_, h=self._hub, r=self._recorder: (h.end_capture(), r.cancel()))
 
         layout = QVBoxLayout(self)
 
+        top = QHBoxLayout()
         self.name_input = QLineEdit(macro["name"] if macro else "")
         self.name_input.setPlaceholderText("Macro name")
-        layout.addWidget(self.name_input)
+        top.addWidget(self.name_input, 1)
+        self.enabled_box = QCheckBox("Enabled")
+        self.enabled_box.setStyleSheet("color: #c9d1d9;")
+        self.enabled_box.setChecked(macro.get("enabled", True) if macro else True)
+        top.addWidget(self.enabled_box)
+        layout.addLayout(top)
 
         self.steps_list = QListWidget()
+        self.steps_list.setStyleSheet(LIST_STYLE)
+        self.steps_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.steps_list.itemDoubleClicked.connect(lambda item: self._edit_current())
         layout.addWidget(self.steps_list)
-        self._refresh_steps()
+        for step in starter_steps:
+            self.steps_list.addItem(self._make_item(step))
 
-        add_row = QHBoxLayout()
-        for label, mode in (("+ Add input", "tap"), ("+ Hold for time", "hold"),
-                            ("+ Hold down", "down"), ("+ Release", "up")):
-            btn = QPushButton(label)
+        hint = QLabel("New steps go after the selected one. Double-click a step to edit it, drag to reorder.")
+        hint.setStyleSheet("color: #8b949e;")
+        layout.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.add_btn = QPushButton("+ Add step  \u25be")
+        self.add_btn.setStyleSheet(BTN_STYLE)
+        self.add_btn.clicked.connect(self._show_add_menu)
+        row.addWidget(self.add_btn)
+        self.record_btn = QPushButton("\u25cf Record")
+        self.record_btn.setStyleSheet(REC_BTN_STYLE)
+        self.record_btn.clicked.connect(self._toggle_record)
+        row.addWidget(self.record_btn)
+        for text, handler in (("Edit", self._edit_current), ("Copy", self._duplicate_step), ("Remove", self._remove_step),
+                              ("Up", self._move_up), ("Down", self._move_down)):
+            btn = QPushButton(text)
             btn.setStyleSheet(BTN_STYLE)
-            btn.clicked.connect(lambda checked=False, m=mode: self._start_input_capture(m))
-            add_row.addWidget(btn)
+            btn.clicked.connect(lambda checked=False, h=handler: h())
+            row.addWidget(btn)
+        layout.addLayout(row)
 
-        add_wait_btn = QPushButton("+ Add wait")
-        add_wait_btn.setStyleSheet(BTN_STYLE)
-        add_wait_btn.clicked.connect(self._add_wait)
-        add_row.addWidget(add_wait_btn)
-        layout.addLayout(add_row)
-
-        move_row = QHBoxLayout()
-        up_btn = QPushButton("Move up")
-        up_btn.setStyleSheet(BTN_STYLE)
-        up_btn.clicked.connect(self._move_up)
-        move_row.addWidget(up_btn)
-
-        down_btn = QPushButton("Move down")
-        down_btn.setStyleSheet(BTN_STYLE)
-        down_btn.clicked.connect(self._move_down)
-        move_row.addWidget(down_btn)
-
-        remove_btn = QPushButton("Remove step")
-        remove_btn.setStyleSheet(BTN_STYLE)
-        remove_btn.clicked.connect(self._remove_step)
-        move_row.addWidget(remove_btn)
-        layout.addLayout(move_row)
-
-        self.loop_checkbox = QCheckBox('Loop until stopped (hotkey/voice "stop" ends it)')
-        self.loop_checkbox.setStyleSheet("color: #c9d1d9;")
-        if macro:
-            self.loop_checkbox.setChecked(bool(macro.get("loop")))
-        layout.addWidget(self.loop_checkbox)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Run:"))
+        self.mode_box = QComboBox()
+        for label, value in MODES:
+            self.mode_box.addItem(label, value)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(_mode_of(macro) if macro else starter_mode))
+        self.mode_box.currentIndexChanged.connect(self._sync_mode_ui)
+        mode_row.addWidget(self.mode_box, 1)
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(1, 100000)
+        self.repeat_spin.setValue(int(macro.get("repeat", 1)) if macro else 1)
+        self.repeat_spin.setSuffix(" times")
+        mode_row.addWidget(self.repeat_spin)
+        layout.addLayout(mode_row)
 
         self.hotkey_btn = QPushButton()
         self.hotkey_btn.setStyleSheet(BTN_STYLE)
         self.hotkey_btn.clicked.connect(self._start_hotkey_capture)
         layout.addWidget(self.hotkey_btn)
-        self._update_hotkey_label()
 
+        only_row = QHBoxLayout()
+        only_row.addWidget(QLabel("Only when the active window title contains:"))
+        self.only_in = QLineEdit(macro.get("only_in", "") if macro else "")
+        self.only_in.setPlaceholderText("(blank = any window)")
+        only_row.addWidget(self.only_in, 1)
+        layout.addLayout(only_row)
+
+        action_row = QHBoxLayout()
+        self.test_btn = QPushButton("Test run")
+        self.test_btn.setStyleSheet(BTN_STYLE)
+        self.test_btn.clicked.connect(self._test_run)
+        action_row.addWidget(self.test_btn)
         save_btn = QPushButton("Save macro")
         save_btn.setStyleSheet(BTN_STYLE)
         save_btn.clicked.connect(self._save)
-        layout.addWidget(save_btn)
+        action_row.addWidget(save_btn)
+        layout.addLayout(action_row)
 
         self.status = QLabel("")
+        self.status.setWordWrap(True)
         self.status.setStyleSheet("color: #d29922;")
         layout.addWidget(self.status)
 
+        # one-shot timer for the Test run countdown, and a ticker that flips the Test button to "Stop test"
+        self._test_delay = QTimer(self)
+        self._test_delay.setSingleShot(True)
+        self._test_delay.timeout.connect(self._start_test)
+        self._test_ticker = QTimer(self)
+        self._test_ticker.timeout.connect(self._sync_test_button)
+        self._test_ticker.start(500)
+
+        self._update_hotkey_label()
+        self._sync_mode_ui()
+
     # ---------- Functions (step list) ----------
 
-    def _refresh_steps(self):
-        self.steps_list.clear()
-        for step in self.steps:
-            kind = step["type"]
-            who = step.get("key") or f"mouse {step.get('button', 'left')}"
-            if kind == "key":
-                self.steps_list.addItem(f"Key: {step['key']}")
-            elif kind == "click":
-                self.steps_list.addItem(f"Click ({step.get('button', 'left')})")
-            elif kind in ("keydown", "mousedown"):
-                self.steps_list.addItem(f"Hold down: {who}")
-            elif kind in ("keyup", "mouseup"):
-                self.steps_list.addItem(f"Release: {who}")
-            elif kind == "hold":
-                self.steps_list.addItem(f"Hold {who} for {step['ms']}ms")
-            else:
-                self.steps_list.addItem(f"Wait: {step['ms']}ms")
+    def _make_item(self, step):
+        step = normalize(step)
+        item = QListWidgetItem(describe(step))
+        item.setData(Qt.ItemDataRole.UserRole, step)
+        return item
 
-    def _add_wait(self):
-        ms, ok = QInputDialog.getInt(self, "Add wait", "Delay in milliseconds:", 200, MIN_WAIT_MS, 60000)
-        if ok:
-            self.steps.append({"type": "wait", "ms": max(ms, MIN_WAIT_MS)})
-            self._refresh_steps()
+    def _steps(self):
+        return [normalize(self.steps_list.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.steps_list.count())]
 
-    def _move_up(self):
-        i = self.steps_list.currentRow()
-        if i > 0:
-            self.steps[i - 1], self.steps[i] = self.steps[i], self.steps[i - 1]
-            self._refresh_steps()
-            self.steps_list.setCurrentRow(i - 1)
+    def _insert_row(self):
+        row = self.steps_list.currentRow()
+        return row + 1 if row >= 0 else self.steps_list.count()
 
-    def _move_down(self):
-        i = self.steps_list.currentRow()
-        if 0 <= i < len(self.steps) - 1:
-            self.steps[i + 1], self.steps[i] = self.steps[i], self.steps[i + 1]
-            self._refresh_steps()
-            self.steps_list.setCurrentRow(i + 1)
+    def _insert_step(self, step):
+        row = self._insert_row()
+        self.steps_list.insertItem(row, self._make_item(step))
+        self.steps_list.setCurrentRow(row)
+
+    def _edit_current(self):
+        item = self.steps_list.currentItem()
+        if item is None:
+            self.status.setText("Select a step first.")
+            return
+        step = normalize(item.data(Qt.ItemDataRole.UserRole))
+        if step.get("type") not in STEPS:
+            self.status.setText("This step type isn't known to this version.")
+            return
+        dlg = StepDialog(self, self._hub, step["type"], step)
+        if dlg.exec():
+            new = dlg.values()
+            item.setData(Qt.ItemDataRole.UserRole, new)
+            item.setText(describe(new))
+        dlg.deleteLater()
+
+    def _duplicate_step(self):
+        item = self.steps_list.currentItem()
+        if item is not None:
+            self._insert_step(copy.deepcopy(item.data(Qt.ItemDataRole.UserRole)))
 
     def _remove_step(self):
-        i = self.steps_list.currentRow()
-        if 0 <= i < len(self.steps):
-            self.steps.pop(i)
-            self._refresh_steps()
+        row = self.steps_list.currentRow()
+        if row >= 0:
+            self.steps_list.takeItem(row)
 
-    # ---------- Functions (step capture: any key OR mouse click, modifier-aware) ----------
+    def _move_up(self):
+        row = self.steps_list.currentRow()
+        if row > 0:
+            self.steps_list.insertItem(row - 1, self.steps_list.takeItem(row))
+            self.steps_list.setCurrentRow(row - 1)
 
-    def _start_input_capture(self, mode="tap"):
-        self._capture_mode = mode
-        self._listening_input = True
-        self._held_modifiers = []
-        self.status.setText(CAPTURE_HINTS[mode])
-        self.setFocus()
-        self._arm_mouse_capture()
+    def _move_down(self):
+        row = self.steps_list.currentRow()
+        if 0 <= row < self.steps_list.count() - 1:
+            self.steps_list.insertItem(row + 1, self.steps_list.takeItem(row))
+            self.steps_list.setCurrentRow(row + 1)
 
-    def _arm_mouse_capture(self):
-        """Global mouse-click listening - a click anywhere on screen counts,
-        not just clicks that land on this widget."""
-        import mouse
-        self._disarm_mouse_capture()
-        self._mouse_handlers = [
-            mouse.on_click(lambda: self._mouse_captured.emit("left")),
-            mouse.on_right_click(lambda: self._mouse_captured.emit("right")),
-            mouse.on_middle_click(lambda: self._mouse_captured.emit("middle")),
-        ]
+    # ---------- Functions (adding steps) ----------
 
-    def _disarm_mouse_capture(self):
-        import mouse
-        for handler in self._mouse_handlers:
-            try:
-                mouse.unhook(handler)
-            except Exception:
-                pass
-        self._mouse_handlers = []
+    def _show_add_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_STYLE)
+        press = menu.addMenu("Press an input (key / mouse / controller)")
+        for label, action in (("Tap it", "tap"), ("Hold it for a set time", "hold"),
+                              ("Hold it down (until a Release step)", "down"), ("Release it", "up")):
+            press.addAction(label).triggered.connect(lambda checked=False, a=action: self._capture_step(a))
+        menu.addSeparator()
+        for step_type, spec in STEPS.items():
+            if spec.get("menu"):
+                menu.addAction(spec["menu"]).triggered.connect(lambda checked=False, t=step_type: self._dialog_step(t))
+        menu.exec(self.add_btn.mapToGlobal(self.add_btn.rect().bottomLeft()))
 
-    def _on_mouse_captured(self, button_name):
-        if not self._listening_input:
-            return   # a key already finished this capture first
-        self._finish_capture({"type": "click", "button": button_name})
+    def _dialog_step(self, step_type):
+        dlg = StepDialog(self, self._hub, step_type)
+        if dlg.exec():
+            self._insert_step(dlg.values())
+        dlg.deleteLater()
 
-    def _cancel_input_capture(self):
-        self._disarm_mouse_capture()
-        self._listening_input = False
-        self._held_modifiers = []
-        self.status.setText("Cancelled.")
-
-    def _finish_capture(self, result):
-        """result is a step dict: {"type": "key", "key": ...} or {"type": "click", "button": ...}."""
-        self._disarm_mouse_capture()
-        self._listening_input = False
-        self._held_modifiers = []
-        self.status.setText("")
-        if self._capture_mode == "hold":
-            QTimer.singleShot(0, lambda r=result: self._ask_hold_time(r))   # ask after this key event finishes
-        else:
-            self.steps.append(self._apply_mode(result))
-            self._refresh_steps()
-
-    def _apply_mode(self, step):
-        """Turns a captured tap into a hold-down or release step when that button was used."""
-        if self._capture_mode in ("down", "up"):
-            prefix = "key" if step["type"] == "key" else "mouse"
-            step["type"] = prefix + self._capture_mode      # keydown, keyup, mousedown, mouseup
-        return step
-
-    def _ask_hold_time(self, captured):
-        ms, ok = QInputDialog.getInt(self, "Hold time", "Hold for (milliseconds):", 500, MIN_WAIT_MS, 600000)
-        if not ok:
-            return
-        step = {"type": "hold", "ms": ms}
-        if captured["type"] == "key":
-            step["key"] = captured["key"]
-        else:
-            step["button"] = captured["button"]
-        self.steps.append(step)
-        self._refresh_steps()
-
-    def keyPressEvent(self, event):
-        if not self._listening_input:
-            super().keyPressEvent(event)
-            return
-        if event.isAutoRepeat():
-            return
-
-        qt_key = event.key()
-
-        if qt_key == Qt.Key.Key_Escape:
-            self._cancel_input_capture()
-            return
-
-        if qt_key in MODIFIER_KEYS:
-            name = MODIFIER_KEYS[qt_key]
-            if name not in self._held_modifiers:
-                self._held_modifiers.append(name)
-            return   # wait to see if it's released alone, or combined with another key
-
-        combo = "+".join(self._held_modifiers + [_resolve_key_name(qt_key, event.modifiers())])
-        self._finish_capture({"type": "key", "key": combo})
-
-    def keyReleaseEvent(self, event):
-        if self._listening_input and not event.isAutoRepeat():
-            qt_key = event.key()
-            if qt_key in MODIFIER_KEYS:
-                name = MODIFIER_KEYS[qt_key]
-                if name in self._held_modifiers:
-                    # released before any other key or click happened - it's a standalone step,
-                    # not "shift+shift"
-                    self._finish_capture({"type": "key", "key": name})
-                    return
-        super().keyReleaseEvent(event)
-
-    # ---------- Functions (trigger capture, save) ----------
-
-    def _start_hotkey_capture(self):
+    def _capture_step(self, action):
+        self._cap_target = ("step", action)
+        self.status.setText(CAPTURE_HINTS[action])
         self._hub.start()
-        self.hotkey_btn.setText("Press a key, combo or controller button (Esc clears)...")
         self._hub.begin_capture()
 
-    def _on_hotkey_captured(self, combo):
-        self.hotkey = combo or None
-        self._update_hotkey_label()
+    def _start_hotkey_capture(self):
+        self._cap_target = ("trigger",)
+        self.hotkey_btn.setText("Press a key, combo, mouse button or controller button (Esc clears)...")
+        self._hub.start()
+        self._hub.begin_capture()
+
+    def _on_captured(self, text):
+        target, self._cap_target = self._cap_target, None
+        if target is None:
+            return                          # the capture belonged to a dialog, not to us
+        if target[0] == "trigger":
+            self.hotkey = text or None
+            self._update_hotkey_label()
+            return
+        if not text:
+            self.status.setText("Cancelled.")
+            return
+        action, ms = target[1], 500
+        if action == "hold":
+            ms, ok = QInputDialog.getInt(self, "Hold time", "Hold for (milliseconds):", 500, 10, 600000)
+            if not ok:
+                self.status.setText("")
+                return
+        step = step_for_input(text, action, ms)
+        if step is None:
+            self.status.setText("Couldn't use that input.")
+            return
+        self._insert_step(step)
+        self.status.setText("")
+
+    # ---------- Functions (recording) ----------
+
+    def _toggle_record(self):
+        if self._recorder.active:
+            self._recorder.stop()
+            return
+        self._hub.end_capture()
+        self._hub.start()
+        self._recorder.start()
+        self.record_btn.setText("\u25a0 Stop recording (F8)")
+        self.status.setText("Recording. Switch to your target and do the actions, then press F8.")
+
+    def _on_recorded(self, steps):
+        self.record_btn.setText("\u25cf Record")
+        if not steps:
+            self.status.setText("Nothing was recorded.")
+            return
+        for step in steps:
+            self._insert_step(step)
+        self.status.setText(f"Recorded {len(steps)} steps. Edit or remove any you don't need.")
+
+    # ---------- Functions (options, test, save) ----------
+
+    def _sync_mode_ui(self):
+        self.repeat_spin.setEnabled(self.mode_box.currentData() == "repeat")
 
     def _update_hotkey_label(self):
-        self.hotkey_btn.setText(f"Trigger: {self.hotkey} (click to change, Esc clears)" if self.hotkey else "Set trigger: key or controller button (optional)")
+        self.hotkey_btn.setText(
+            f"Trigger: {self.hotkey}   (click to change, Esc clears)" if self.hotkey
+            else "Set trigger: a key, combo, mouse button or controller button (optional)"
+        )
+
+    def _sync_test_button(self):
+        try:
+            from core.macro_runner import is_running
+            self.test_btn.setText("Stop test" if is_running(TEST_NAME) else "Test run")
+        except ImportError:
+            pass
+
+    def _test_run(self):
+        try:
+            from core.macro_runner import is_running, stop_macro_by_name
+        except ImportError:
+            self.status.setText("Install requirements.txt first (`keyboard`/`mouse` missing).")
+            return
+        if is_running(TEST_NAME):
+            stop_macro_by_name(TEST_NAME)
+            self.status.setText("Test stopped.")
+            return
+        steps = self._steps()
+        if not steps:
+            self.status.setText("Add at least one step first.")
+            return
+        self._pending_test = {"name": TEST_NAME, "mode": self.mode_box.currentData(),
+                              "repeat": self.repeat_spin.value(), "steps": steps}
+        self.status.setText("Test starts in 3 seconds - switch to your target window...")
+        self._test_delay.start(3000)
+
+    def _start_test(self):
+        from core.macro_runner import trigger_macro
+        if self._pending_test:
+            self.status.setText(trigger_macro(self._pending_test))
+            self._pending_test = None
 
     def _save(self):
         self._hub.end_capture()
-        self._disarm_mouse_capture()
         name = self.name_input.text().strip()
+        steps = self._steps()
         if not name:
             self.status.setText("Give it a name first.")
             return
-        if not self.steps:
+        if not steps:
             self.status.setText("Add at least one step.")
             return
 
-        macros = [m for m in load_macros() if m["name"] not in (self.original_name, name)]
-        macros.append({
-            "name": name, "hotkey": self.hotkey, "loop": self.loop_checkbox.isChecked(), "steps": self.steps,
+        macros = load_macros()
+        for other in macros:
+            if other["name"] == self.original_name:
+                continue
+            if other["name"] == name:
+                self.status.setText(f'A macro named "{name}" already exists.')
+                return
+            if self.hotkey and other.get("hotkey") and other.get("enabled", True) \
+                    and parse_combo(other["hotkey"]) == parse_combo(self.hotkey):
+                self.status.setText(f'That trigger is already used by "{other["name"]}".')
+                return
+
+        mode = self.mode_box.currentData()
+        macro = dict(self.macro or {})
+        macro.update({
+            "name": name, "enabled": self.enabled_box.isChecked(), "hotkey": self.hotkey, "mode": mode,
+            "loop": mode in ("toggle", "hold"), "repeat": self.repeat_spin.value(),
+            "only_in": self.only_in.text().strip(), "steps": steps,
         })
+        index = next((i for i, m in enumerate(macros) if m["name"] == self.original_name), None)
+        if index is None:
+            macros.append(macro)
+        else:
+            macros[index] = macro
         save_macros(macros)
 
         try:

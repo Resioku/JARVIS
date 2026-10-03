@@ -14,14 +14,15 @@ import json
 import math
 import random
 import time
+from collections import deque
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QStackedWidget, QProgressBar
+    QStackedWidget, QProgressBar, QGridLayout
 )
-from PyQt6.QtCore import Qt, QTimer, QVariantAnimation
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtCore import Qt, QTimer, QVariantAnimation, QPropertyAnimation, QEasingCurve, QPoint, QPointF
+from PyQt6.QtGui import QFont, QCursor, QPainter, QColor, QPen, QPolygonF
 
 SAVE_PATH = Path(__file__).resolve().parent / "_clicker_save.json"
 
@@ -80,7 +81,6 @@ QProgressBar::chunk { background-color: #a371f7; border-radius: 3px; }
 
 # ---------- Game contract ----------
 NAME = "Clicker"
-PANEL_SIZE = (420, 640)   # roomier than the default panel; the shop and trophies need it
 
 
 def create_widget():
@@ -90,7 +90,8 @@ def create_widget():
 # ---------- Variables (balance knobs) ----------
 COST_GROWTH = 1.15                 # Cookie Clicker's building cost growth
 CLICK_UPGRADE_BASE_COST = 50
-CLICK_UPGRADE_GROWTH = 1.25
+CLICK_UPGRADE_GROWTH = 1.35
+CLICK_UPGRADE_BONUS = 0.05         # each click upgrade level also adds +5% to your whole click value (multiplies with the 1% of CPS part)
 CLICK_CPS_SHARE = 0.01             # each click also earns 1% of your base per-second rate
 MILESTONES = [25, 50, 100, 150, 200, 250, 300]   # owning this many of a building doubles its output
 BUY_AMOUNTS = [1, 10, 25, 100, "MAX"]            # the selector buttons. Edit freely, "MAX" = all you can afford
@@ -108,17 +109,20 @@ OFFLINE_CAP_SECONDS = None         # None = no limit. e.g. 8 * 3600 to stop coun
 CRIT_BASE_CHANCE = 0.05
 CRIT_BASE_MULT = 5.0
 AUTO_CLICKS_PER_LEVEL = 1.0        # each Auto Clicker shop level = this many clicks per second
+AUTO_CLICKS_USE_COMBO = False      # True = auto clicks also build/use the combo. False = combo is for manual clicking only
+CLICK_RATE_CAP = 10                # clicks/sec that earn full value. Faster than this (macros, external autoclickers) is scaled
+                                   # down so total click income stops growing. Owning Auto Clicker levels raises the cap to match.
 COMBO_WINDOW = 1.5                 # seconds you can pause before the combo resets
 COMBO_BONUS = 0.005                # +0.5% click value per combo step
 COMBO_MAX = 100                    # combo stops growing here (+50% click value)
 FLOAT_MS = 900
-FLOAT_RISE = 70
+FLOAT_RISE = 50
 
 # ---- Golden orbs ----
 GOLDEN_INTERVAL = (30, 90)
 GOLDEN_LIFETIME = 12
 FRENZY_MULT, FRENZY_SECONDS = 7, 30
-CLICK_FRENZY_MULT, CLICK_FRENZY_SECONDS = 20, 15
+CLICK_FRENZY_MULT, CLICK_FRENZY_SECONDS = 7, 15
 
 TICK_MS = 250
 SAVE_EVERY_TICKS = 20
@@ -277,6 +281,7 @@ def click_value(state):
         (state["click_power"] + CLICK_CPS_SHARE * base_cps(state))
         * prestige_multiplier(state)
         * (1 + 0.10 * shop_level(state, "fingers"))
+        * (1 + CLICK_UPGRADE_BONUS * state.get("click_level", 0))
     )
 
 
@@ -307,14 +312,70 @@ def stat_value(state, key):
     return state.get(key, 0)      # clicks / crits / golden
 
 
+def new_state():
+    return {
+        "score": 0, "total_alltime": 0, "click_power": 1, "click_level": 0,
+        "buildings": {}, "prestige_points": 0, "prestige_spent": 0, "shop": {},
+        "clicks": 0, "crits": 0, "golden": 0, "ach": [], "buy_mode": 0, "last_seen": time.time(),
+    }
+
+
 def _write_state(state):
     state["last_seen"] = time.time()
     SAVE_PATH.write_text(json.dumps(state), encoding="utf-8")
 
 
+# ---------- Ghost cursor (decoration for the Auto Clicker) ----------
+
+class GhostCursor(QWidget):
+    """A small pointer that wanders over the click button and taps while the Auto Clicker runs.
+    Purely visual - the real auto clicks happen in the game loop."""
+    TIP = QPoint(2, 1)    # where the arrow's tip sits inside this widget
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedSize(22, 30)
+        self._dip = 0.0
+        self._tap_anim = QVariantAnimation(self)
+        self._tap_anim.setDuration(160)
+        self._tap_anim.setStartValue(0.0)
+        self._tap_anim.setEndValue(1.0)
+        self._tap_anim.valueChanged.connect(self._set_dip)
+        self._move_anim = QPropertyAnimation(self, b"pos", self)
+        self._move_anim.setDuration(900)
+        self._move_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+    def _set_dip(self, t):
+        self._dip = 4 * math.sin(math.pi * float(t))      # presses down a few pixels, then back up
+        self.update()
+
+    def tap(self):
+        self._tap_anim.stop()
+        self._tap_anim.start()
+
+    def glide_to(self, pos):
+        self._move_anim.stop()
+        self._move_anim.setStartValue(self.pos())
+        self._move_anim.setEndValue(pos)
+        self._move_anim.start()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.translate(0, self._dip)
+        points = ((2, 1), (2, 20), (6.5, 16), (10, 24.5), (13.5, 23), (10, 15), (16, 15))
+        p.setPen(QPen(QColor("#0d1117"), 1.4))
+        p.setBrush(QColor("#e6edf3"))
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+
+
 # ---------- Widget ----------
 
 class ClickerGame(QWidget):
+    # NavStack reads this off the widget to resize the panel while the game is open
+    PANEL_SIZE = (480, 700)
+
     def __init__(self):
         super().__init__()
         self.state = self._load()
@@ -326,9 +387,15 @@ class ClickerGame(QWidget):
         self.combo = 0
         self._last_click = 0.0
         self._auto_acc = 0.0
+        self._auto_crit_next = 0.0    # earliest time the next small auto-crit text may appear
         self._orb = None
         self._ticks = 0
         self._last_tick = time.monotonic()
+        self._click_times = deque()      # timestamps of clicks in the last second, for the rate cap
+        self._reset_armed = False
+        self._reset_timer = QTimer(self)
+        self._reset_timer.setSingleShot(True)
+        self._reset_timer.timeout.connect(self._disarm_reset)
         self.buy_index = min(self.state.get("buy_mode", 0), len(BUY_AMOUNTS) - 1)
 
         outer = QVBoxLayout(self)
@@ -338,6 +405,9 @@ class ClickerGame(QWidget):
         self.stack.addWidget(self._build_main())
         self.stack.addWidget(self._build_shop())
         self.stack.addWidget(self._build_trophies())
+        self.stack.addWidget(self._build_settings())
+        self.ghost = GhostCursor(self)
+        self.ghost.hide()
 
         # ---------- Timers ----------
         self.timer = QTimer(self)
@@ -351,6 +421,12 @@ class ClickerGame(QWidget):
         self.orb_timer.setSingleShot(True)
         self.orb_timer.timeout.connect(self._remove_orb)
         self._schedule_golden()
+
+        # cosmetic only: a ghost cursor wanders over the click button and taps while the Auto Clicker runs
+        self.auto_vis_timer = QTimer(self)
+        self.auto_vis_timer.timeout.connect(self.ghost.tap)
+        self.ghost_timer = QTimer(self)
+        self.ghost_timer.timeout.connect(self._ghost_wander)
 
         # the panel deletes this widget on Back - save one last time when that happens
         self.destroyed.connect(lambda _=None, s=self.state: _write_state(s))
@@ -384,11 +460,23 @@ class ClickerGame(QWidget):
         self.rate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.rate_label)
 
-        self.buff_label = QLabel()
-        self.buff_label.setFixedHeight(18)
-        self.buff_label.setStyleSheet("color: #f2cc60; font-weight: bold;")
-        self.buff_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.buff_label)
+        # fixed 2x2 grid: each effect always has its own cell, so nothing shifts or runs together
+        status = QWidget()
+        status.setFixedHeight(36)
+        grid = QGridLayout(status)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        self.slots = {}
+        for key, (row, col, color) in {
+            "event": (0, 0, "#f2cc60"), "combo": (0, 1, "#00e5ff"),
+            "frenzy": (1, 0, "#ffa657"), "clickfrenzy": (1, 1, "#79c0ff"),
+        }.items():
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+            grid.addWidget(lbl, row, col)
+            self.slots[key] = lbl
+        layout.addWidget(status)
 
         self.prestige_label = QLabel()
         self.prestige_label.setStyleSheet("color: #a371f7;")
@@ -417,15 +505,25 @@ class ClickerGame(QWidget):
         row.addWidget(self.trophy_btn)
         layout.addLayout(row)
 
-        self.click_btn = QPushButton("Click me")
+        click_row = QHBoxLayout()
+        self.click_btn = QPushButton("CLICK")
+        self.click_btn.setFixedHeight(64)
         self.click_btn.setStyleSheet(CLICK_STYLE)
         self.click_btn.clicked.connect(self.on_click)
-        layout.addWidget(self.click_btn)
+        click_row.addWidget(self.click_btn, 3)
 
         self.click_upgrade_btn = QPushButton()
+        self.click_upgrade_btn.setFixedHeight(64)
         self.click_upgrade_btn.setStyleSheet(BTN_STYLE)
         self.click_upgrade_btn.clicked.connect(self.buy_click_upgrade)
-        layout.addWidget(self.click_upgrade_btn)
+        click_row.addWidget(self.click_upgrade_btn, 2)
+        layout.addLayout(click_row)
+
+        self.auto_label = QLabel()
+        self.auto_label.setFixedHeight(16)
+        self.auto_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.auto_label.setStyleSheet("color: #3fb950;")
+        layout.addWidget(self.auto_label)
 
         amount_row = QHBoxLayout()
         amount_row.addWidget(QLabel("Buy:"))
@@ -439,10 +537,15 @@ class ClickerGame(QWidget):
             amount_row.addWidget(btn)
             self.amount_btns.append(btn)
         amount_row.addStretch()
+        settings_btn = QPushButton("Settings")
+        settings_btn.setStyleSheet(AMOUNT_STYLE)
+        settings_btn.clicked.connect(lambda: self.stack.setCurrentIndex(3))
+        amount_row.addWidget(settings_btn)
         layout.addLayout(amount_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent; border: none;")
         container = QWidget()
         buildings_layout = QVBoxLayout(container)
@@ -496,6 +599,7 @@ class ClickerGame(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent; border: none;")
         container = QWidget()
         items = QVBoxLayout(container)
@@ -521,6 +625,7 @@ class ClickerGame(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent; border: none;")
         container = QWidget()
         items = QVBoxLayout(container)
@@ -535,6 +640,54 @@ class ClickerGame(QWidget):
         scroll.setWidget(container)
         lay.addWidget(scroll)
         return page
+
+    def _build_settings(self):
+        page, lay = self._page("settings_header")
+        self.settings_header.setText("Settings")
+        info = QLabel(f"Progress is saved automatically to:\n{SAVE_PATH}")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #8b949e;")
+        lay.addWidget(info)
+        self.reset_btn = QPushButton("Reset all progress")
+        self.reset_btn.setStyleSheet(PURPLE_STYLE.replace("#a371f7", "#f85149"))
+        self.reset_btn.clicked.connect(self._reset_pressed)
+        lay.addWidget(self.reset_btn)
+        warn = QLabel("Wipes EVERYTHING: Bytes, buildings, prestige, shop upgrades and trophies. "
+                      "Useful for testing the game from the very start.")
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color: #8b949e;")
+        lay.addWidget(warn)
+        lay.addStretch()
+        return page
+
+    def _reset_pressed(self):
+        if not self._reset_armed:                       # first click only arms it
+            self._reset_armed = True
+            self.reset_btn.setText("Click again to ERASE EVERYTHING (5s)")
+            self._reset_timer.start(5000)
+            return
+        self._do_reset()
+
+    def _disarm_reset(self):
+        self._reset_armed = False
+        self.reset_btn.setText("Reset all progress")
+
+    def _do_reset(self):
+        self._reset_timer.stop()
+        self._disarm_reset()
+        self.state.clear()                              # mutate in place: other code holds this same dict
+        self.state.update(new_state())
+        self.buffs.clear()
+        self.combo = 0
+        self._auto_acc = 0.0
+        self._click_times.clear()
+        self.event_text, self.event_until = "", 0.0
+        self.buy_index = 0
+        for i, btn in enumerate(self.amount_btns):
+            btn.setChecked(i == 0)
+        self._save()
+        self._refresh()
+        self.stack.setCurrentIndex(0)
 
     # ---------- Functions (save/load) ----------
 
@@ -565,11 +718,7 @@ class ClickerGame(QWidget):
             return data
 
         self._offline_gain = 0
-        return {
-            "score": 0, "total_alltime": 0, "click_power": 1, "click_level": 0,
-            "buildings": {}, "prestige_points": 0, "prestige_spent": 0, "shop": {},
-            "clicks": 0, "crits": 0, "golden": 0, "ach": [], "buy_mode": 0, "last_seen": now,
-        }
+        return new_state()
 
     def _save(self):
         _write_state(self.state)
@@ -579,13 +728,14 @@ class ClickerGame(QWidget):
     def _click_center(self):
         return self.click_btn.mapTo(self, self.click_btn.rect().center())
 
-    def _float_text(self, text, rgb=(0, 229, 255), big=False, pos=None):
+    def _float_text(self, text, rgb=(0, 229, 255), big=False, pos=None, size=None, rise=None):
         """Text that flies up from the cursor (or `pos`) and fades out. Re-styles the
         label's color alpha each frame instead of using a graphics effect, which can
         break translucent windows on Windows."""
         if pos is None:
             pos = self.mapFromGlobal(QCursor.pos())
-        size = 18 if big else 13
+        size = size or (18 if big else 13)
+        rise = rise or FLOAT_RISE
         lbl = QLabel(text, self)
         lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
@@ -599,7 +749,7 @@ class ClickerGame(QWidget):
         hint = lbl.sizeHint()
         lbl.resize(hint.width() + 10, hint.height() + 4)
         x = pos.x() - lbl.width() // 2 + random.randint(-14, 14)
-        y0 = pos.y() - 28
+        y0 = pos.y() - 12
         lbl.move(x, y0)
         lbl.show()
         lbl.raise_()
@@ -611,7 +761,7 @@ class ClickerGame(QWidget):
 
         def step(t):
             t = float(t)
-            lbl.move(x, int(y0 - FLOAT_RISE * (1 - (1 - t) ** 3)))
+            lbl.move(x, int(y0 - rise * (1 - (1 - t) ** 3)))
             style(255 if t < 0.4 else max(0, int(255 * (1 - t) / 0.6)))
 
         anim.valueChanged.connect(step)
@@ -704,31 +854,26 @@ class ClickerGame(QWidget):
         now = time.monotonic()
         rate = total_cps(s) * self._prod_mult()
         clk = click_value(s) * self._click_mult() * self._combo_mult()
-        auto = shop_level(s, "autoclick") * AUTO_CLICKS_PER_LEVEL
 
         self.score_label.setText(f"{fmt(s['score'])} Bytes")
-        auto_text = f"  |  auto {auto:g}/s" if auto else ""
+        self.click_btn.setText(f"CLICK   +{fmt(clk)}")
         self.rate_label.setText(
-            f"+{fmt(clk)} / click ({crit_chance(s) * 100:.0f}% crit){auto_text}   |   +{fmt(rate)} / sec"
+            f"+{fmt(clk)} / click ({crit_chance(s) * 100:.0f}% crit)   |   +{fmt(rate)} / sec"
         )
+        self._sync_auto_visual()
 
-        parts = []
-        if self.event_until > now:
-            parts.append(self.event_text)
-        if self.combo >= 5:
-            parts.append(f"COMBO x{self.combo}")
-        for name, label in (("frenzy", f"FRENZY x{FRENZY_MULT}"), ("clickfrenzy", f"CLICK FRENZY x{CLICK_FRENZY_MULT}")):
+        self.slots["event"].setText(self.event_text if self.event_until > now else "")
+        self.slots["combo"].setText(f"COMBO x{self.combo}  (+{min(self.combo, COMBO_MAX) * COMBO_BONUS * 100:.0f}%)" if self.combo >= 5 else "")
+        for name, label in (("frenzy", f"PRODUCTION x{FRENZY_MULT}"), ("clickfrenzy", f"CLICKS x{CLICK_FRENZY_MULT}")):
             left = self.buffs.get(name, 0) - now
-            if left > 0:
-                parts.append(f"{label} {left:.0f}s")
-        self.buff_label.setText("  |  ".join(parts))
+            self.slots[name].setText(f"{label}  {left:.0f}s" if left > 0 else "")
 
         points = s["prestige_points"]
         gain = prestige_gain_available(s)
         lo, hi = prestige_threshold(points), prestige_threshold(points + 1)
         pct = points * PRESTIGE_BONUS_PER_POINT * 100
         self.prestige_label.setText(
-            f"Prestige {points} (+{pct:.0f}%)  |  next at {fmt(hi)} lifetime ({fmt(s['total_alltime'])})"
+            f"Prestige {points} (+{pct:.0f}%)  |  next at {fmt(hi)}  |  have {fmt(s['total_alltime'])}"
         )
         frac = 1.0 if gain > 0 else max(0.0, min(1.0, (s["total_alltime"] - lo) / max(1, hi - lo)))
         self.prestige_bar.setValue(int(frac * 1000))
@@ -762,7 +907,7 @@ class ClickerGame(QWidget):
             self.ach_labels[aid].setStyleSheet("color: #3fb950;" if got else "color: #4d5560;")
 
         cost = click_upgrade_cost(s["click_level"])
-        self.click_upgrade_btn.setText(f"Upgrade click power +1 (cost: {fmt(cost)})")
+        self.click_upgrade_btn.setText(f"Upgrade click power\nLv {s['click_level']}  (+1 and +{CLICK_UPGRADE_BONUS * 100:.0f}% each)\nCost: {fmt(cost)}")
         self.click_upgrade_btn.setEnabled(s["score"] >= cost)
 
         amount = BUY_AMOUNTS[self.buy_index]
@@ -781,12 +926,72 @@ class ClickerGame(QWidget):
             mx.setText(f"MAX {can_max}" if can_max else "MAX")
             mx.setEnabled(can_max >= 1)
 
+    # ---------- Functions (auto clicker visuals) ----------
+
+    def _ghost_target(self):
+        """A spot on the click button, kept off the centered CLICK text."""
+        top_left = self.click_btn.mapTo(self, QPoint(0, 0))
+        w, h = self.click_btn.width(), self.click_btn.height()
+        side = random.choice(((0.08, 0.30), (0.70, 0.92)))
+        x = top_left.x() + int(w * random.uniform(*side))
+        y = top_left.y() + int(h * random.uniform(0.15, 0.5))
+        return QPoint(x, y) - GhostCursor.TIP
+
+    def _ghost_tip(self):
+        return self.ghost.pos() + GhostCursor.TIP
+
+    def _ghost_wander(self):
+        if self.ghost.isVisible():
+            self.ghost.glide_to(self._ghost_target())
+
+    def _sync_auto_visual(self):
+        s = self.state
+        rate = shop_level(s, "autoclick") * AUTO_CLICKS_PER_LEVEL
+        if rate <= 0:
+            self.auto_label.setText("")
+            self.auto_vis_timer.stop()
+            self.ghost_timer.stop()
+            self.ghost.hide()
+            return
+        # expected Bytes per second from auto clicks, counting crits and any click frenzy
+        per_click = click_value(s) * self._click_mult() * (1 + crit_chance(s) * (crit_multiplier(s) - 1))
+        if AUTO_CLICKS_USE_COMBO:
+            per_click *= self._combo_mult()
+        self.auto_label.setText(f"Auto Clicker: {rate:g} clicks/sec  =  about {fmt(rate * per_click)} Bytes/sec")
+        if self.stack.currentIndex() != 0:
+            self.ghost.hide()
+            return
+        if not self.ghost.isVisible():
+            self.ghost.move(self._ghost_target())
+            self.ghost.show()
+            self.ghost.raise_()
+        tap_ms = int(1000 / min(rate, 4))          # taps at the real rate, capped so it stays calm
+        if not self.auto_vis_timer.isActive() or self.auto_vis_timer.interval() != tap_ms:
+            self.auto_vis_timer.start(tap_ms)
+        if not self.ghost_timer.isActive():
+            self.ghost_timer.start(1600)
+
     # ---------- Functions (actions) ----------
 
-    def _click_once(self, manual):
+    def _click_once(self, auto=False):
+        """THE click. Manual clicks and Auto Clicker clicks both come through here, so they
+        get the same click value, upgrades, crits, frenzy, combo and stats."""
         s = self.state
+        use_combo = (not auto) or AUTO_CLICKS_USE_COMBO
+        if use_combo:
+            now = time.monotonic()
+            self.combo = self.combo + 1 if now - self._last_click <= COMBO_WINDOW else 1
+            self._last_click = now
+        s["clicks"] += 1
         gain = click_value(s) * self._click_mult()
-        if manual:
+        # rate cap: however fast clicks arrive, total click income stops at the cap (owned auto clicks raise it)
+        t = time.monotonic()
+        self._click_times.append(t)
+        while self._click_times and t - self._click_times[0] > 1.0:
+            self._click_times.popleft()
+        cap = max(CLICK_RATE_CAP, shop_level(s, "autoclick") * AUTO_CLICKS_PER_LEVEL)
+        gain *= min(1.0, cap / len(self._click_times))
+        if use_combo:
             gain *= self._combo_mult()
         crit = random.random() < crit_chance(s)
         if crit:
@@ -797,11 +1002,7 @@ class ClickerGame(QWidget):
         return gain, crit
 
     def on_click(self):
-        now = time.monotonic()
-        self.combo = self.combo + 1 if now - self._last_click <= COMBO_WINDOW else 1
-        self._last_click = now
-        self.state["clicks"] += 1
-        gain, crit = self._click_once(True)
+        gain, crit = self._click_once()
         if crit:
             self._float_text(f"CRIT! +{fmt(gain)}", (242, 204, 96), big=True)
         else:
@@ -824,13 +1025,13 @@ class ClickerGame(QWidget):
             self._auto_acc += level * AUTO_CLICKS_PER_LEVEL * dt
             n = min(int(self._auto_acc), 60)
             self._auto_acc -= int(self._auto_acc)
-            best = None
+            crit_hit = False
             for _ in range(n):
-                value, crit = self._click_once(False)
-                if crit:
-                    best = value
-            if best is not None and self.stack.currentIndex() == 0:
-                self._float_text(f"AUTO CRIT! +{fmt(best)}", (242, 204, 96), big=True, pos=self._click_center())
+                _value, crit = self._click_once(auto=True)
+                crit_hit = crit_hit or crit
+            if crit_hit and now >= self._auto_crit_next and self.stack.currentIndex() == 0:
+                self._float_text("crit!", (242, 204, 96), pos=self._ghost_tip(), size=11, rise=22)
+                self._auto_crit_next = now + 1.5
 
         if self.combo and now - self._last_click > COMBO_WINDOW:
             self.combo = 0

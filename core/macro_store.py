@@ -1,7 +1,8 @@
 """
-Loads/saves macros.json — the list of saved macros (name, hotkey, loop
-flag, steps) — plus shared voice-matching so both the "run" and "stop"
-voice commands find the right macro the same way.
+Loads/saves macros.json - the list of saved macros (name, trigger, run mode,
+steps, ...) - plus shared voice-matching so both the "run" and "stop"
+voice commands find the right macro the same way. Disabled macros are
+skipped by voice matching.
 """
 import difflib
 import json
@@ -31,9 +32,10 @@ def save_macros(macros: list):
 def match_macro(text: str, macros: list = None):
     """Finds which saved macro a spoken phrase refers to, or None.
     Tries an exact whole-word match first, then falls back to fuzzy
-    matching on the phrase with filler words stripped — this is what
+    matching on the phrase with filler words stripped - this is what
     makes multi-word or slightly misheard names still work."""
     macros = load_macros() if macros is None else macros
+    macros = [m for m in macros if m.get("enabled", True)]
     if not macros:
         return None
 
@@ -53,7 +55,7 @@ def match_macro(text: str, macros: list = None):
         return macros[names.index(close[0])]
 
     # phonetic fallback: catches names that sound right but got misheard/
-    # misspelled by STT (e.g. "well skate" heard as "will skid" — both
+    # misspelled by STT (e.g. "well skate" heard as "will skid" - both
     # produce the same metaphone code, even though the letters differ a lot)
     heard_sound = jellyfish.metaphone(stripped)
     name_sounds = [jellyfish.metaphone(n) for n in names]

@@ -11,3 +11,4 @@ openwakeword
 pywin32
 sounddevice
 jellyfish
+vgamepad

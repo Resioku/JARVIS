@@ -11,7 +11,7 @@ all behave the same way.
 """
 import logging
 import time
-
+import atexit
 import keyboard
 import mouse
 from PyQt6.QtCore import QThread
@@ -40,10 +40,50 @@ def _sleep_interruptible(ms, should_stop):
         time.sleep(min(STOP_CHECK_INTERVAL_MS, max(0, (end - time.monotonic()) * 1000)) / 1000)
 
 
-def _run_steps_once(macro, should_stop, apply_floor):
-    """apply_floor adds the small built-in delay after every step — only
-    needed for loop macros, where a zero-wait loop could otherwise hammer
-    the target app. A normal macro runs at exactly the timing you set."""
+_active_held = []   # every running macro's held inputs, so quitting JARVIS can let go too
+
+
+def _target(step):
+    if "key" in step:
+        return ("key", step["key"])
+    return ("mouse", step.get("button", "left"))
+
+
+def _down(held, target):
+    kind, name = target
+    if kind == "key":
+        keyboard.press(name)
+    else:
+        mouse.press(button=name)
+    held.add(target)
+
+
+def _up(held, target):
+    kind, name = target
+    if kind == "key":
+        keyboard.release(name)
+    else:
+        mouse.release(button=name)
+    held.discard(target)
+
+
+def _release_held(held):
+    """Lets go of anything a macro pressed and never released."""
+    for kind, name in list(held):
+        try:
+            if kind == "key":
+                keyboard.release(name)
+            else:
+                mouse.release(button=name)
+        except Exception:
+            log.exception("Couldn't release %s %s", kind, name)
+    held.clear()
+
+
+atexit.register(lambda: [_release_held(h) for h in list(_active_held)])
+
+
+def _run_steps_once(macro, should_stop, apply_floor, held):
     for step in macro.get("steps", []):
         if should_stop():
             return
@@ -52,10 +92,17 @@ def _run_steps_once(macro, should_stop, apply_floor):
 
         if kind == "key":
             keyboard.press_and_release(step["key"])
-
         elif kind == "click":
             mouse.click(button=step.get("button", "left"))
-
+        elif kind in ("keydown", "mousedown"):
+            _down(held, _target(step))
+        elif kind in ("keyup", "mouseup"):
+            _up(held, _target(step))
+        elif kind == "hold":
+            target = _target(step)
+            _down(held, target)
+            _sleep_interruptible(step.get("ms", 0), should_stop)
+            _up(held, target)
         elif kind == "wait":
             _sleep_interruptible(step.get("ms", 0), should_stop)
 
@@ -64,13 +111,11 @@ def _run_steps_once(macro, should_stop, apply_floor):
 
 
 def run_macro(macro: dict):
-    """Runs a macro's steps exactly once, blocking until done, with no
-    extra delay added — used for non-loop macros."""
-    _run_steps_once(
-        macro,
-        should_stop=lambda: False,
-        apply_floor=False
-    )
+    held = set()
+    try:
+        _run_steps_once(macro, should_stop=lambda: False, apply_floor=False, held=held)
+    finally:
+        _release_held(held)
 
 
 # ---------- Threads ----------
@@ -91,23 +136,19 @@ class MacroRunnerThread(QThread):
         return self._stop_requested
 
     def run(self):
+        held = set()
+        _active_held.append(held)
         try:
             if self.macro.get("loop"):
                 while not self._stop_requested:
-                    _run_steps_once(
-                        self.macro,
-                        self._should_stop,
-                        apply_floor=True
-                    )
+                    _run_steps_once(self.macro, self._should_stop, apply_floor=True, held=held)
             else:
-                _run_steps_once(
-                    self.macro,
-                    self._should_stop,
-                    apply_floor=False
-                )
+                _run_steps_once(self.macro, self._should_stop, apply_floor=False, held=held)
         except Exception:
             log.exception("Macro '%s' failed", self.macro.get("name"))
         finally:
+            _release_held(held)
+            _active_held.remove(held)
             _running_loops.pop(self.macro.get("name"), None)
 
 

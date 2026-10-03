@@ -1,10 +1,11 @@
 """
 SECTION: Macros
-Build a macro by hand: click "+ Add key" and press the key you want it
-to send (hold Shift/Ctrl/Alt for a combo), "+ Add click" for a mouse
-click, or "+ Add wait" for a timed pause. Optionally bind a hotkey, and
-turn on "Loop until stopped" for something like an autoclicker. Every
-saved macro also becomes a voice command automatically.
+Build a macro by hand: "+ Add input" taps a key or mouse button, "+ Hold for
+time" holds one for a set number of milliseconds, "+ Hold down" / "+ Release"
+hold something across other steps, and "+ Add wait" pauses. Optionally bind a
+trigger (a key, a key combo, or a controller button) and turn on "Loop until
+stopped" for something like an autoclicker. Every saved macro is also a
+voice command automatically.
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
@@ -46,9 +47,8 @@ MODIFIER_KEYS = {
     Qt.Key.Key_Meta: "windows",
 }
 
-# the `keyboard` library has its own separate names for numpad keys (confirmed
-# against its source) — Qt's own "Num+1" style string doesn't match them at all,
-# which is exactly why numpad hotkeys silently did nothing
+# numpad names used when a numpad key is captured as a STEP (the `keyboard`
+# library can only replay these as the matching digit/operator)
 NUMPAD_KEY_NAMES = {
     Qt.Key.Key_0: "num 0", Qt.Key.Key_1: "num 1", Qt.Key.Key_2: "num 2",
     Qt.Key.Key_3: "num 3", Qt.Key.Key_4: "num 4", Qt.Key.Key_5: "num 5",
@@ -66,6 +66,14 @@ SAMPLES = {
         {"type": "wait", "ms": 100},
         {"type": "key", "key": "ctrl+v"},
     ],
+    "Hold W for 2 seconds": [{"type": "hold", "key": "w", "ms": 2000}],
+}
+
+CAPTURE_HINTS = {
+    "tap": "Press any key or click any mouse button (hold Shift/Ctrl/Alt for a combo, Esc cancels)...",
+    "hold": "Press the key or button to HOLD (you'll set how long next, Esc cancels)...",
+    "down": "Press the key or button to HOLD DOWN until a Release step (Esc cancels)...",
+    "up": "Press the key or button to RELEASE (Esc cancels)...",
 }
 
 
@@ -75,8 +83,7 @@ def _qt_key_to_name(qt_key: int) -> str:
 
 
 def _resolve_key_name(qt_key: int, modifiers) -> str:
-    """Like _qt_key_to_name, but checks for the numpad modifier first so
-    numpad keys get the name `keyboard` actually recognizes."""
+    """Like _qt_key_to_name, but checks for the numpad modifier first."""
     if modifiers & Qt.KeyboardModifier.KeypadModifier and qt_key in NUMPAD_KEY_NAMES:
         return NUMPAD_KEY_NAMES[qt_key]
     return _qt_key_to_name(qt_key)
@@ -94,7 +101,7 @@ def create_widget(nav):
 
 class MacroList(QWidget):
     # a wider panel for this page so the list and its Run/Edit/Delete
-    # buttons have room to breathe — Panel reads this automatically
+    # buttons have room to breathe - Panel reads this automatically
     PANEL_SIZE = (560, 460)
 
     def __init__(self, nav):
@@ -227,13 +234,13 @@ class MacroList(QWidget):
             self.status_label.setText("Install requirements.txt first (`keyboard`/`mouse` missing).")
             return
 
-        # stopping a loop is instant — no need to wait or switch windows for that
+        # stopping a loop is instant - no need to wait or switch windows for that
         if macro.get("loop") and is_running(macro["name"]):
             self.status_label.setText(trigger_macro(macro))
             self._refresh_run_labels()
             return
 
-        self.status_label.setText(f'Switch to the target window — running "{macro["name"]}" in 3 seconds...')
+        self.status_label.setText(f'Switch to the target window - running "{macro["name"]}" in 3 seconds...')
         QTimer.singleShot(3000, lambda m=macro: self._start_trigger(m))
 
     def _start_trigger(self, macro):
@@ -250,7 +257,7 @@ class MacroList(QWidget):
 
 
 class MacroEditor(QWidget):
-    """Add key/click/wait steps, optionally set a hotkey and loop, then save."""
+    """Add key/click/hold/wait steps, optionally set a trigger and loop, then save."""
 
     PANEL_SIZE = (560, 460)
     _mouse_captured = pyqtSignal(str)   # emitted from the `mouse` library's own thread; Qt queues it safely to this widget's thread
@@ -263,12 +270,15 @@ class MacroEditor(QWidget):
         self.steps = starter_steps
         self.hotkey = macro.get("hotkey") if macro else None
         self._listening_input = False
-        self._listening_hotkey = False
+        self._capture_mode = "tap"       # tap / hold / down / up - what the next captured input becomes
         self._held_modifiers = []
         self._mouse_handlers = []
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._mouse_captured.connect(self._on_mouse_captured)
+
+        # triggers (keys, combos, controller buttons) are captured by the input hub,
+        # which sees exactly what will later fire the macro
         from core.input_hub import get_hub
         self._hub = get_hub()
         self._hub.captured.connect(self._on_hotkey_captured)
@@ -285,10 +295,12 @@ class MacroEditor(QWidget):
         self._refresh_steps()
 
         add_row = QHBoxLayout()
-        add_input_btn = QPushButton("+ Add input")
-        add_input_btn.setStyleSheet(BTN_STYLE)
-        add_input_btn.clicked.connect(self._start_input_capture)
-        add_row.addWidget(add_input_btn)
+        for label, mode in (("+ Add input", "tap"), ("+ Hold for time", "hold"),
+                            ("+ Hold down", "down"), ("+ Release", "up")):
+            btn = QPushButton(label)
+            btn.setStyleSheet(BTN_STYLE)
+            btn.clicked.connect(lambda checked=False, m=mode: self._start_input_capture(m))
+            add_row.addWidget(btn)
 
         add_wait_btn = QPushButton("+ Add wait")
         add_wait_btn.setStyleSheet(BTN_STYLE)
@@ -339,10 +351,18 @@ class MacroEditor(QWidget):
     def _refresh_steps(self):
         self.steps_list.clear()
         for step in self.steps:
-            if step["type"] == "key":
+            kind = step["type"]
+            who = step.get("key") or f"mouse {step.get('button', 'left')}"
+            if kind == "key":
                 self.steps_list.addItem(f"Key: {step['key']}")
-            elif step["type"] == "click":
+            elif kind == "click":
                 self.steps_list.addItem(f"Click ({step.get('button', 'left')})")
+            elif kind in ("keydown", "mousedown"):
+                self.steps_list.addItem(f"Hold down: {who}")
+            elif kind in ("keyup", "mouseup"):
+                self.steps_list.addItem(f"Release: {who}")
+            elif kind == "hold":
+                self.steps_list.addItem(f"Hold {who} for {step['ms']}ms")
             else:
                 self.steps_list.addItem(f"Wait: {step['ms']}ms")
 
@@ -372,19 +392,21 @@ class MacroEditor(QWidget):
             self.steps.pop(i)
             self._refresh_steps()
 
-    # ---------- Functions (input capture: any key OR mouse click, modifier-aware) ----------
+    # ---------- Functions (step capture: any key OR mouse click, modifier-aware) ----------
 
-    def _start_input_capture(self):
+    def _start_input_capture(self, mode="tap"):
+        self._capture_mode = mode
         self._listening_input = True
         self._held_modifiers = []
-        self.status.setText("Press any key or click any mouse button (hold Shift/Ctrl/Alt for a combo, Esc cancels)...")
+        self.status.setText(CAPTURE_HINTS[mode])
         self.setFocus()
         self._arm_mouse_capture()
 
     def _arm_mouse_capture(self):
-        """Global mouse-click listening — a click anywhere on screen counts,
+        """Global mouse-click listening - a click anywhere on screen counts,
         not just clicks that land on this widget."""
         import mouse
+        self._disarm_mouse_capture()
         self._mouse_handlers = [
             mouse.on_click(lambda: self._mouse_captured.emit("left")),
             mouse.on_right_click(lambda: self._mouse_captured.emit("right")),
@@ -402,7 +424,7 @@ class MacroEditor(QWidget):
 
     def _on_mouse_captured(self, button_name):
         if not self._listening_input:
-            return   # a key already finished this capture first, or a hotkey is being captured instead
+            return   # a key already finished this capture first
         self._finish_capture({"type": "click", "button": button_name})
 
     def _cancel_input_capture(self):
@@ -412,22 +434,38 @@ class MacroEditor(QWidget):
         self.status.setText("Cancelled.")
 
     def _finish_capture(self, result):
-        """result is a step dict ({"type": "key"/"click", ...}) when capturing
-        a macro step, or a plain hotkey string when capturing a hotkey."""
+        """result is a step dict: {"type": "key", "key": ...} or {"type": "click", "button": ...}."""
         self._disarm_mouse_capture()
-        if self._listening_hotkey:
-            self.hotkey = result
-            self._listening_hotkey = False
-            self._update_hotkey_label()
-        else:
-            self.steps.append(result)
-            self._listening_input = False
-            self.status.setText("")
-            self._refresh_steps()
+        self._listening_input = False
         self._held_modifiers = []
+        self.status.setText("")
+        if self._capture_mode == "hold":
+            QTimer.singleShot(0, lambda r=result: self._ask_hold_time(r))   # ask after this key event finishes
+        else:
+            self.steps.append(self._apply_mode(result))
+            self._refresh_steps()
+
+    def _apply_mode(self, step):
+        """Turns a captured tap into a hold-down or release step when that button was used."""
+        if self._capture_mode in ("down", "up"):
+            prefix = "key" if step["type"] == "key" else "mouse"
+            step["type"] = prefix + self._capture_mode      # keydown, keyup, mousedown, mouseup
+        return step
+
+    def _ask_hold_time(self, captured):
+        ms, ok = QInputDialog.getInt(self, "Hold time", "Hold for (milliseconds):", 500, MIN_WAIT_MS, 600000)
+        if not ok:
+            return
+        step = {"type": "hold", "ms": ms}
+        if captured["type"] == "key":
+            step["key"] = captured["key"]
+        else:
+            step["button"] = captured["button"]
+        self.steps.append(step)
+        self._refresh_steps()
 
     def keyPressEvent(self, event):
-        if not (self._listening_input or self._listening_hotkey):
+        if not self._listening_input:
             super().keyPressEvent(event)
             return
         if event.isAutoRepeat():
@@ -436,12 +474,7 @@ class MacroEditor(QWidget):
         qt_key = event.key()
 
         if qt_key == Qt.Key.Key_Escape:
-            if self._listening_hotkey:
-                self.hotkey = None
-                self._listening_hotkey = False
-                self._update_hotkey_label()
-            else:
-                self._cancel_input_capture()
+            self._cancel_input_capture()
             return
 
         if qt_key in MODIFIER_KEYS:
@@ -451,21 +484,21 @@ class MacroEditor(QWidget):
             return   # wait to see if it's released alone, or combined with another key
 
         combo = "+".join(self._held_modifiers + [_resolve_key_name(qt_key, event.modifiers())])
-        self._finish_capture(combo if self._listening_hotkey else {"type": "key", "key": combo})
+        self._finish_capture({"type": "key", "key": combo})
 
     def keyReleaseEvent(self, event):
-        if (self._listening_input or self._listening_hotkey) and not event.isAutoRepeat():
+        if self._listening_input and not event.isAutoRepeat():
             qt_key = event.key()
             if qt_key in MODIFIER_KEYS:
                 name = MODIFIER_KEYS[qt_key]
                 if name in self._held_modifiers:
-                    # released before any other key or click happened — it's a standalone step/hotkey,
-                    # not "shift+shift" — this is also what fixes that doubled-modifier bug
-                    self._finish_capture(name if self._listening_hotkey else {"type": "key", "key": name})
+                    # released before any other key or click happened - it's a standalone step,
+                    # not "shift+shift"
+                    self._finish_capture({"type": "key", "key": name})
                     return
         super().keyReleaseEvent(event)
 
-    # ---------- Functions (hotkey capture, save) ----------
+    # ---------- Functions (trigger capture, save) ----------
 
     def _start_hotkey_capture(self):
         self._hub.start()
@@ -477,9 +510,10 @@ class MacroEditor(QWidget):
         self._update_hotkey_label()
 
     def _update_hotkey_label(self):
-        self.hotkey_btn.setText(f"Hotkey: {self.hotkey} (click to change, Esc clears)" if self.hotkey else "Set hotkey (optional)")
+        self.hotkey_btn.setText(f"Trigger: {self.hotkey} (click to change, Esc clears)" if self.hotkey else "Set trigger: key or controller button (optional)")
 
     def _save(self):
+        self._hub.end_capture()
         self._disarm_mouse_capture()
         name = self.name_input.text().strip()
         if not name:

@@ -1,14 +1,11 @@
 """
 GAME: Clicker
-An idle/clicker game built on Cookie Clicker's core math:
-  - building cost = base * 1.15^owned
-  - owning 25/50/100/... of a building doubles its output (milestones)
-  - a click is worth a slice of your per-second rate, so clicking never dies
-  - clicks can crit, with the damage floating up from your cursor
-  - golden orbs pop up at random: lucky bonus, production frenzy, click frenzy
-  - Ascend for permanent prestige points (sqrt scaled, +2% production each),
-    then SPEND points in the Prestige Shop on permanent upgrades. Spending
-    never lowers your prestige bonus, only the points you can still spend.
+Idle/clicker built on proven formulas:
+  - Cookie Clicker: building cost = base * 1.15^owned, 25/50/100... owned
+    doubles a building, golden orbs, prestige that never costs you your bonus
+  - Bulk buying (1x / 10x / 25x / 100x / MAX) using the exact geometric sum
+  - Achievements, each worth +1% production (Cookie Clicker's milk idea)
+  - Click combo for active play, crits, and a Prestige Shop with an Auto Clicker
 
 TO MAKE A NEW GAME: copy this whole file to games/yourgame.py, change
 NAME, and replace the widget's contents.
@@ -20,7 +17,8 @@ import time
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QStackedWidget
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
+    QStackedWidget, QProgressBar
 )
 from PyQt6.QtCore import Qt, QTimer, QVariantAnimation
 from PyQt6.QtGui import QFont, QCursor
@@ -35,6 +33,22 @@ QPushButton {
 QPushButton:hover { background-color: #21262d; border-color: #00e5ff; }
 QPushButton:disabled { color: #4d5560; border-color: #21262d; }
 """
+MAX_STYLE = """
+QPushButton {
+    background-color: #161b22; color: #00e5ff; border: 1px solid #30363d;
+    border-radius: 8px; padding: 4px; text-align: center; font-weight: bold;
+}
+QPushButton:hover { background-color: #21262d; border-color: #00e5ff; }
+QPushButton:disabled { color: #4d5560; border-color: #21262d; }
+"""
+AMOUNT_STYLE = """
+QPushButton {
+    background-color: #161b22; color: #8b949e; border: 1px solid #30363d;
+    border-radius: 6px; padding: 3px 8px; text-align: center;
+}
+QPushButton:hover { border-color: #00e5ff; }
+QPushButton:checked { background-color: #00e5ff; color: #0d1117; font-weight: bold; }
+"""
 CLICK_STYLE = """
 QPushButton {
     background-color: #161b22; color: #00e5ff; border: 1px solid #00e5ff;
@@ -43,7 +57,7 @@ QPushButton {
 QPushButton:hover { background-color: #21262d; }
 QPushButton:pressed { background-color: #0d1117; }
 """
-ASCEND_STYLE = """
+PURPLE_STYLE = """
 QPushButton {
     background-color: #161b22; color: #a371f7; border: 1px solid #30363d;
     border-radius: 8px; padding: 8px; text-align: center;
@@ -51,14 +65,7 @@ QPushButton {
 QPushButton:hover { background-color: #21262d; border-color: #a371f7; }
 QPushButton:disabled { color: #4d5560; border-color: #21262d; }
 """
-SHOP_STYLE = """
-QPushButton {
-    background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d;
-    border-radius: 8px; padding: 6px; text-align: left;
-}
-QPushButton:hover { background-color: #21262d; border-color: #a371f7; }
-QPushButton:disabled { color: #4d5560; border-color: #21262d; }
-"""
+SHOP_STYLE = BTN_STYLE.replace("#00e5ff", "#a371f7")
 GOLD_STYLE = """
 QPushButton {
     background-color: #d29922; color: #0d1117; border: 2px solid #f2cc60;
@@ -66,10 +73,14 @@ QPushButton {
 }
 QPushButton:hover { background-color: #f2cc60; }
 """
+BAR_STYLE = """
+QProgressBar { background-color: #161b22; border: 1px solid #30363d; border-radius: 4px; }
+QProgressBar::chunk { background-color: #a371f7; border-radius: 3px; }
+"""
 
 # ---------- Game contract ----------
 NAME = "Clicker"
-PANEL_SIZE = (400, 580)   # a bit bigger than the default panel so the shop and buildings have room
+PANEL_SIZE = (420, 640)   # roomier than the default panel; the shop and trophies need it
 
 
 def create_widget():
@@ -82,9 +93,11 @@ CLICK_UPGRADE_BASE_COST = 50
 CLICK_UPGRADE_GROWTH = 1.25
 CLICK_CPS_SHARE = 0.01             # each click also earns 1% of your base per-second rate
 MILESTONES = [25, 50, 100, 150, 200, 250, 300]   # owning this many of a building doubles its output
+BUY_AMOUNTS = [1, 10, 25, 100, "MAX"]            # the selector buttons. Edit freely, "MAX" = all you can afford
 
 ASCEND_DIVISOR = 100_000           # points = sqrt(lifetime / this)
 PRESTIGE_BONUS_PER_POINT = 0.02    # +2% global production per prestige point earned, forever
+ACHIEVEMENT_BONUS = 0.01           # +1% global production per achievement
 
 # ---- Offline progress ----
 OFFLINE_ENABLED = True             # False = nothing is earned while the game screen is closed
@@ -92,19 +105,23 @@ OFFLINE_RATE = 1.0                 # 1.0 = full speed, exactly like it was open 
 OFFLINE_CAP_SECONDS = None         # None = no limit. e.g. 8 * 3600 to stop counting after 8 hours
 
 # ---- Clicking ----
-CRIT_BASE_CHANCE = 0.05            # 5% of clicks crit before shop upgrades
-CRIT_BASE_MULT = 5.0               # crits hit for x5 before shop upgrades
-FLOAT_MS = 900                     # how long the floating "+123" text lives
-FLOAT_RISE = 70                    # how many pixels it floats upward
+CRIT_BASE_CHANCE = 0.05
+CRIT_BASE_MULT = 5.0
+AUTO_CLICKS_PER_LEVEL = 1.0        # each Auto Clicker shop level = this many clicks per second
+COMBO_WINDOW = 1.5                 # seconds you can pause before the combo resets
+COMBO_BONUS = 0.005                # +0.5% click value per combo step
+COMBO_MAX = 100                    # combo stops growing here (+50% click value)
+FLOAT_MS = 900
+FLOAT_RISE = 70
 
 # ---- Golden orbs ----
-GOLDEN_INTERVAL = (30, 90)         # seconds between orbs (only counts while the game is open)
-GOLDEN_LIFETIME = 12               # seconds an orb stays clickable
-FRENZY_MULT, FRENZY_SECONDS = 7, 30                # production x7
-CLICK_FRENZY_MULT, CLICK_FRENZY_SECONDS = 20, 15   # click value x20
+GOLDEN_INTERVAL = (30, 90)
+GOLDEN_LIFETIME = 12
+FRENZY_MULT, FRENZY_SECONDS = 7, 30
+CLICK_FRENZY_MULT, CLICK_FRENZY_SECONDS = 20, 15
 
-TICK_MS = 250                      # game loop speed, so numbers visibly flow
-SAVE_EVERY_TICKS = 20              # save every 5 seconds (plus on every purchase)
+TICK_MS = 250
+SAVE_EVERY_TICKS = 20
 
 BUILDINGS = [
     {"id": "intern",     "name": "Intern",           "base_cost": 15,          "cps": 0.1},
@@ -117,15 +134,53 @@ BUILDINGS = [
     {"id": "singular",   "name": "Singularity",      "base_cost": 330_000_000, "cps": 44_000},
 ]
 
-# Prestige Shop: permanent upgrades bought with prestige points.
-# cost of next level = base * growth^level. max=None would mean uncapped.
+# Prestige Shop: permanent upgrades. cost of next level = base * growth^level.
 SHOP = [
-    {"id": "crit_chance", "name": "Critical Chance", "desc": "+1% crit chance",       "base": 5,  "growth": 1.25, "max": 25},
-    {"id": "crit_power",  "name": "Critical Power",  "desc": "+0.5x crit damage",     "base": 10, "growth": 1.25, "max": 20},
-    {"id": "fingers",     "name": "Strong Fingers",  "desc": "+10% click value",      "base": 5,  "growth": 1.25, "max": 40},
-    {"id": "overclock",   "name": "Overclock",       "desc": "+5% all production",    "base": 8,  "growth": 1.25, "max": 40},
-    {"id": "discount",    "name": "Bulk Discount",   "desc": "-2% building costs",    "base": 15, "growth": 1.30, "max": 15},
-    {"id": "orbs",        "name": "Lucky Streak",    "desc": "-15% time between orbs", "base": 10, "growth": 2.00, "max": 5},
+    {"id": "autoclick",   "name": "Auto Clicker",    "desc": "+1 auto click/sec (crits too)", "base": 25, "growth": 1.30, "max": 30},
+    {"id": "crit_chance", "name": "Critical Chance", "desc": "+1% crit chance",               "base": 5,  "growth": 1.25, "max": 25},
+    {"id": "crit_power",  "name": "Critical Power",  "desc": "+0.5x crit damage",             "base": 10, "growth": 1.25, "max": 20},
+    {"id": "fingers",     "name": "Strong Fingers",  "desc": "+10% click value",              "base": 5,  "growth": 1.25, "max": 40},
+    {"id": "overclock",   "name": "Overclock",       "desc": "+5% all production",            "base": 8,  "growth": 1.25, "max": 40},
+    {"id": "discount",    "name": "Bulk Discount",   "desc": "-2% building costs",            "base": 15, "growth": 1.30, "max": 15},
+    {"id": "orbs",        "name": "Lucky Streak",    "desc": "-15% time between orbs",        "base": 10, "growth": 2.00, "max": 5},
+    {"id": "extender",    "name": "Frenzy Extender", "desc": "+5s on every frenzy",           "base": 12, "growth": 1.60, "max": 6},
+    {"id": "headstart",   "name": "Head Start",      "desc": "Start runs with free buildings", "base": 20, "growth": 1.50, "max": 10},
+]
+HEAD_START = {"intern": 10, "script": 5, "server": 2}   # per Head Start level, given after you Ascend
+
+# Achievements: (id, name, description, stat, threshold). Each is worth +1% production.
+ACHIEVEMENTS = [
+    ("life1", "First Steps",      "Earn 1K lifetime Bytes",      "lifetime", 1e3),
+    ("life2", "Pocket Change",    "Earn 1M lifetime Bytes",      "lifetime", 1e6),
+    ("life3", "Big Data",         "Earn 1B lifetime Bytes",      "lifetime", 1e9),
+    ("life4", "Terabyte Club",    "Earn 1T lifetime Bytes",      "lifetime", 1e12),
+    ("life5", "Petabyte Pioneer", "Earn 1Qa lifetime Bytes",     "lifetime", 1e15),
+    ("life6", "Beyond Measure",   "Earn 1Qi lifetime Bytes",     "lifetime", 1e18),
+    ("clk1",  "Warming Up",       "Click 100 times",             "clicks", 100),
+    ("clk2",  "Finger Workout",   "Click 1,000 times",           "clicks", 1_000),
+    ("clk3",  "Carpal Tunnel",    "Click 10,000 times",          "clicks", 10_000),
+    ("clk4",  "Click Machine",    "Click 100,000 times",         "clicks", 100_000),
+    ("crt1",  "Lucky Strike",     "Land 10 crits",               "crits", 10),
+    ("crt2",  "Sharpshooter",     "Land 100 crits",              "crits", 100),
+    ("crt3",  "Critical Mass",    "Land 1,000 crits",            "crits", 1_000),
+    ("gld1",  "Shiny!",           "Click a golden orb",          "golden", 1),
+    ("gld2",  "Orb Hunter",       "Click 10 golden orbs",        "golden", 10),
+    ("gld3",  "Midas Touch",      "Click 50 golden orbs",        "golden", 50),
+    ("own1",  "Small Fleet",      "Own 10 of one building",      "max_owned", 10),
+    ("own2",  "Fleet Manager",    "Own 50 of one building",      "max_owned", 50),
+    ("own3",  "Empire",           "Own 100 of one building",     "max_owned", 100),
+    ("own4",  "Monopoly",         "Own 200 of one building",     "max_owned", 200),
+    ("cps1",  "Passive Income",   "Produce 100 Bytes/sec",       "cps", 1e2),
+    ("cps2",  "Cash Flow",        "Produce 100K Bytes/sec",      "cps", 1e5),
+    ("cps3",  "Money Printer",    "Produce 100M Bytes/sec",      "cps", 1e8),
+    ("cps4",  "Economy Breaker",  "Produce 100B Bytes/sec",      "cps", 1e11),
+    ("pre1",  "Reborn",           "Reach 1 prestige point",      "prestige", 1),
+    ("pre2",  "Ascended",         "Reach 100 prestige points",   "prestige", 100),
+    ("pre3",  "Transcendent",     "Reach 1,000 prestige points", "prestige", 1_000),
+    ("pre4",  "Eternal",          "Reach 10,000 prestige points", "prestige", 10_000),
+    ("shp1",  "Investor",         "Buy a shop upgrade",          "shop_total", 1),
+    ("shp2",  "Big Spender",      "Own 25 shop levels",          "shop_total", 25),
+    ("shp3",  "Collector",        "Own 100 shop levels",         "shop_total", 100),
 ]
 
 SUFFIXES = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"]
@@ -162,9 +217,27 @@ def crit_multiplier(state):
     return CRIT_BASE_MULT + 0.5 * shop_level(state, "crit_power")
 
 
-def building_cost(building, owned, state=None):
-    discount = 0.98 ** shop_level(state, "discount") if state else 1.0
-    return math.ceil(building["base_cost"] * (COST_GROWTH ** owned) * discount)
+def _unit_cost(building, owned, state):
+    """Cost of the very next building, before bulk math."""
+    discount = 0.98 ** shop_level(state, "discount")
+    return building["base_cost"] * (COST_GROWTH ** owned) * discount
+
+
+def bulk_cost(building, owned, n, state):
+    """Exact cost of buying n at once: a geometric series, same as Cookie Clicker's bulk buy."""
+    return math.ceil(_unit_cost(building, owned, state) * (COST_GROWTH ** n - 1) / (COST_GROWTH - 1))
+
+
+def max_affordable(building, owned, bank, state):
+    unit = _unit_cost(building, owned, state)
+    if bank < unit:
+        return 0
+    n = int(math.log(1 + bank * (COST_GROWTH - 1) / unit) / math.log(COST_GROWTH))
+    while n > 0 and bulk_cost(building, owned, n, state) > bank:    # guard against float rounding
+        n -= 1
+    while bulk_cost(building, owned, n + 1, state) <= bank:
+        n += 1
+    return n
 
 
 def click_upgrade_cost(level):
@@ -180,12 +253,15 @@ def next_milestone(owned):
 
 
 def prestige_multiplier(state):
-    """Prestige bonus from points earned, times the Overclock shop upgrade."""
-    return (1 + PRESTIGE_BONUS_PER_POINT * state.get("prestige_points", 0)) * (1 + 0.05 * shop_level(state, "overclock"))
+    """Prestige points x Overclock shop upgrade x achievements."""
+    return (
+        (1 + PRESTIGE_BONUS_PER_POINT * state.get("prestige_points", 0))
+        * (1 + 0.05 * shop_level(state, "overclock"))
+        * (1 + ACHIEVEMENT_BONUS * len(state.get("ach", [])))
+    )
 
 
 def base_cps(state):
-    """Per-second output from buildings (with milestone doublers), before prestige."""
     return sum(
         state["buildings"].get(b["id"], 0) * b["cps"] * milestone_mult(state["buildings"].get(b["id"], 0))
         for b in BUILDINGS
@@ -197,7 +273,6 @@ def total_cps(state):
 
 
 def click_value(state):
-    """Flat click power plus a slice of your passive rate, so clicks stay relevant late game."""
     return (
         (state["click_power"] + CLICK_CPS_SHARE * base_cps(state))
         * prestige_multiplier(state)
@@ -206,7 +281,6 @@ def click_value(state):
 
 
 def total_earned_prestige(state):
-    """Prestige points your lifetime Bytes have ever earned (cumulative, sqrt scaled)."""
     return int(math.sqrt(max(0, state.get("total_alltime", 0)) / ASCEND_DIVISOR))
 
 
@@ -214,9 +288,23 @@ def prestige_gain_available(state):
     return max(0, total_earned_prestige(state) - state.get("prestige_points", 0))
 
 
-def next_prestige_threshold(state):
-    target = state.get("prestige_points", 0) + 1
-    return (target ** 2) * ASCEND_DIVISOR
+def prestige_threshold(points):
+    """Lifetime Bytes needed to have earned this many points in total."""
+    return (points ** 2) * ASCEND_DIVISOR
+
+
+def stat_value(state, key):
+    if key == "lifetime":
+        return state.get("total_alltime", 0)
+    if key == "max_owned":
+        return max(state["buildings"].values(), default=0)
+    if key == "prestige":
+        return state.get("prestige_points", 0)
+    if key == "shop_total":
+        return sum(state.get("shop", {}).values())
+    if key == "cps":
+        return total_cps(state)
+    return state.get(key, 0)      # clicks / crits / golden
 
 
 def _write_state(state):
@@ -235,20 +323,48 @@ class ClickerGame(QWidget):
         self.buffs = {}            # "frenzy"/"clickfrenzy" -> monotonic expiry time
         self.event_text = ""
         self.event_until = 0.0
+        self.combo = 0
+        self._last_click = 0.0
+        self._auto_acc = 0.0
         self._orb = None
         self._ticks = 0
         self._last_tick = time.monotonic()
+        self.buy_index = min(self.state.get("buy_mode", 0), len(BUY_AMOUNTS) - 1)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack)
+        self.stack.addWidget(self._build_main())
+        self.stack.addWidget(self._build_shop())
+        self.stack.addWidget(self._build_trophies())
 
-        # ---------- Main page ----------
+        # ---------- Timers ----------
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.on_tick)
+        self.timer.start(TICK_MS)
+
+        self.golden_timer = QTimer(self)
+        self.golden_timer.setSingleShot(True)
+        self.golden_timer.timeout.connect(self._spawn_golden)
+        self.orb_timer = QTimer(self)
+        self.orb_timer.setSingleShot(True)
+        self.orb_timer.timeout.connect(self._remove_orb)
+        self._schedule_golden()
+
+        # the panel deletes this widget on Back - save one last time when that happens
+        self.destroyed.connect(lambda _=None, s=self.state: _write_state(s))
+
+        self._check_achievements(silent=True)
+        self._refresh()
+
+    # ---------- Functions (building the pages) ----------
+
+    def _build_main(self):
         main = QWidget()
         layout = QVBoxLayout(main)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
 
         if self._offline_gain > 0:
             welcome = QLabel(f"+{fmt(self._offline_gain)} Bytes while you were away")
@@ -279,27 +395,51 @@ class ClickerGame(QWidget):
         self.prestige_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.prestige_label)
 
-        prestige_row = QHBoxLayout()
+        self.prestige_bar = QProgressBar()
+        self.prestige_bar.setRange(0, 1000)
+        self.prestige_bar.setTextVisible(False)
+        self.prestige_bar.setFixedHeight(8)
+        self.prestige_bar.setStyleSheet(BAR_STYLE)
+        layout.addWidget(self.prestige_bar)
+
+        row = QHBoxLayout()
         self.ascend_btn = QPushButton()
-        self.ascend_btn.setStyleSheet(ASCEND_STYLE)
+        self.ascend_btn.setStyleSheet(PURPLE_STYLE)
         self.ascend_btn.clicked.connect(self.ascend)
-        prestige_row.addWidget(self.ascend_btn)
-
+        row.addWidget(self.ascend_btn)
         self.shop_btn = QPushButton()
-        self.shop_btn.setStyleSheet(ASCEND_STYLE)
+        self.shop_btn.setStyleSheet(PURPLE_STYLE)
         self.shop_btn.clicked.connect(lambda: self.stack.setCurrentIndex(1))
-        prestige_row.addWidget(self.shop_btn)
-        layout.addLayout(prestige_row)
+        row.addWidget(self.shop_btn)
+        self.trophy_btn = QPushButton()
+        self.trophy_btn.setStyleSheet(PURPLE_STYLE)
+        self.trophy_btn.clicked.connect(lambda: self.stack.setCurrentIndex(2))
+        row.addWidget(self.trophy_btn)
+        layout.addLayout(row)
 
-        click_btn = QPushButton("Click me")
-        click_btn.setStyleSheet(CLICK_STYLE)
-        click_btn.clicked.connect(self.on_click)
-        layout.addWidget(click_btn)
+        self.click_btn = QPushButton("Click me")
+        self.click_btn.setStyleSheet(CLICK_STYLE)
+        self.click_btn.clicked.connect(self.on_click)
+        layout.addWidget(self.click_btn)
 
         self.click_upgrade_btn = QPushButton()
         self.click_upgrade_btn.setStyleSheet(BTN_STYLE)
         self.click_upgrade_btn.clicked.connect(self.buy_click_upgrade)
         layout.addWidget(self.click_upgrade_btn)
+
+        amount_row = QHBoxLayout()
+        amount_row.addWidget(QLabel("Buy:"))
+        self.amount_btns = []
+        for i, amount in enumerate(BUY_AMOUNTS):
+            btn = QPushButton("MAX" if amount == "MAX" else f"{amount}x")
+            btn.setCheckable(True)
+            btn.setChecked(i == self.buy_index)
+            btn.setStyleSheet(AMOUNT_STYLE)
+            btn.clicked.connect(lambda checked, idx=i: self._set_buy_index(idx))
+            amount_row.addWidget(btn)
+            self.amount_btns.append(btn)
+        amount_row.addStretch()
+        layout.addLayout(amount_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -308,54 +448,47 @@ class ClickerGame(QWidget):
         buildings_layout = QVBoxLayout(container)
         buildings_layout.setSpacing(4)
         # built ONCE and updated in place - rebuilding every tick was eating clicks mid-press
-        self.building_btns = {}
+        self.building_btns, self.building_max = {}, {}
         for b in BUILDINGS:
+            line = QHBoxLayout()
+            line.setSpacing(4)
             btn = QPushButton()
             btn.setStyleSheet(BTN_STYLE)
-            btn.clicked.connect(lambda checked, bid=b["id"]: self.buy_building(bid))
-            buildings_layout.addWidget(btn)
+            btn.clicked.connect(lambda checked, bid=b["id"]: self.buy_building(bid, BUY_AMOUNTS[self.buy_index]))
+            line.addWidget(btn, 1)
+            maxbtn = QPushButton("MAX")
+            maxbtn.setFixedWidth(64)
+            maxbtn.setStyleSheet(MAX_STYLE)
+            maxbtn.clicked.connect(lambda checked, bid=b["id"]: self.buy_building(bid, "MAX"))
+            line.addWidget(maxbtn)
+            buildings_layout.addLayout(line)
             self.building_btns[b["id"]] = btn
+            self.building_max[b["id"]] = maxbtn
         scroll.setWidget(container)
         layout.addWidget(scroll)
+        return main
 
-        self.stack.addWidget(main)
-        self.stack.addWidget(self._build_shop())
-
-        # ---------- Timers ----------
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.on_tick)
-        self.timer.start(TICK_MS)
-
-        self.golden_timer = QTimer(self)
-        self.golden_timer.setSingleShot(True)
-        self.golden_timer.timeout.connect(self._spawn_golden)
-        self.orb_timer = QTimer(self)
-        self.orb_timer.setSingleShot(True)
-        self.orb_timer.timeout.connect(self._remove_orb)
-        self._schedule_golden()
-
-        # the panel deletes this widget on Back - save one last time when that happens
-        self.destroyed.connect(lambda _=None, s=self.state: _write_state(s))
-
-        self._refresh()
-
-    def _build_shop(self):
+    def _page(self, title_widget_attr):
+        """Shared layout for the shop and trophies pages: Back button + header label + scroll area."""
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-
         top = QHBoxLayout()
         back = QPushButton("< Back")
-        back.setStyleSheet(ASCEND_STYLE)
+        back.setStyleSheet(PURPLE_STYLE)
         back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
         top.addWidget(back)
-        self.shop_points_label = QLabel()
-        self.shop_points_label.setStyleSheet("color: #a371f7; font-weight: bold;")
-        self.shop_points_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top.addWidget(self.shop_points_label, 1)
+        header = QLabel()
+        header.setStyleSheet("color: #a371f7; font-weight: bold;")
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        setattr(self, title_widget_attr, header)
+        top.addWidget(header, 1)
         lay.addLayout(top)
+        return page, lay
 
+    def _build_shop(self):
+        page, lay = self._page("shop_points_label")
         hint = QLabel("Permanent upgrades. They survive Ascending, and spending points never lowers your prestige bonus.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8b949e;")
@@ -365,16 +498,40 @@ class ClickerGame(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("background: transparent; border: none;")
         container = QWidget()
-        items_layout = QVBoxLayout(container)
-        items_layout.setSpacing(4)
+        items = QVBoxLayout(container)
+        items.setSpacing(4)
         self.shop_btns = {}
         for item in SHOP:
             btn = QPushButton()
             btn.setStyleSheet(SHOP_STYLE)
             btn.clicked.connect(lambda checked, iid=item["id"]: self.buy_shop(iid))
-            items_layout.addWidget(btn)
+            items.addWidget(btn)
             self.shop_btns[item["id"]] = btn
-        items_layout.addStretch()
+        items.addStretch()
+        scroll.setWidget(container)
+        lay.addWidget(scroll)
+        return page
+
+    def _build_trophies(self):
+        page, lay = self._page("trophy_header")
+        self.stats_label = QLabel()
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet("color: #8b949e;")
+        lay.addWidget(self.stats_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        container = QWidget()
+        items = QVBoxLayout(container)
+        items.setSpacing(3)
+        self.ach_labels = {}
+        for ach in ACHIEVEMENTS:
+            label = QLabel()
+            label.setWordWrap(True)
+            items.addWidget(label)
+            self.ach_labels[ach[0]] = label
+        items.addStretch()
         scroll.setWidget(container)
         lay.addWidget(scroll)
         return page
@@ -392,6 +549,9 @@ class ClickerGame(QWidget):
             data.setdefault("shop", {})
             data.setdefault("click_power", 1)
             data.setdefault("click_level", 0)
+            for key in ("clicks", "crits", "golden", "buy_mode"):
+                data.setdefault(key, 0)
+            data.setdefault("ach", [])
 
             gain = 0
             if OFFLINE_ENABLED:
@@ -407,7 +567,8 @@ class ClickerGame(QWidget):
         self._offline_gain = 0
         return {
             "score": 0, "total_alltime": 0, "click_power": 1, "click_level": 0,
-            "buildings": {}, "prestige_points": 0, "prestige_spent": 0, "shop": {}, "last_seen": now,
+            "buildings": {}, "prestige_points": 0, "prestige_spent": 0, "shop": {},
+            "clicks": 0, "crits": 0, "golden": 0, "ach": [], "buy_mode": 0, "last_seen": now,
         }
 
     def _save(self):
@@ -415,11 +576,15 @@ class ClickerGame(QWidget):
 
     # ---------- Functions (floating text) ----------
 
-    def _float_text(self, text, rgb=(0, 229, 255), big=False):
-        """Text that flies up from the cursor and fades out. Drawn by re-styling
-        the label's color alpha each frame (no graphics effect, which can break
-        translucent windows on Windows)."""
-        pos = self.mapFromGlobal(QCursor.pos())
+    def _click_center(self):
+        return self.click_btn.mapTo(self, self.click_btn.rect().center())
+
+    def _float_text(self, text, rgb=(0, 229, 255), big=False, pos=None):
+        """Text that flies up from the cursor (or `pos`) and fades out. Re-styles the
+        label's color alpha each frame instead of using a graphics effect, which can
+        break translucent windows on Windows."""
+        if pos is None:
+            pos = self.mapFromGlobal(QCursor.pos())
         size = 18 if big else 13
         lbl = QLabel(text, self)
         lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -446,8 +611,8 @@ class ClickerGame(QWidget):
 
         def step(t):
             t = float(t)
-            lbl.move(x, int(y0 - FLOAT_RISE * (1 - (1 - t) ** 3)))   # fast start, eases out
-            style(255 if t < 0.4 else max(0, int(255 * (1 - t) / 0.6)))   # holds, then fades
+            lbl.move(x, int(y0 - FLOAT_RISE * (1 - (1 - t) ** 3)))
+            style(255 if t < 0.4 else max(0, int(255 * (1 - t) / 0.6)))
 
         anim.valueChanged.connect(step)
         anim.finished.connect(lbl.deleteLater)
@@ -463,6 +628,9 @@ class ClickerGame(QWidget):
 
     def _click_mult(self):
         return CLICK_FRENZY_MULT if self._active("clickfrenzy") else 1
+
+    def _combo_mult(self):
+        return 1 + min(self.combo, COMBO_MAX) * COMBO_BONUS
 
     def _schedule_golden(self):
         shrink = 0.85 ** shop_level(self.state, "orbs")
@@ -493,7 +661,9 @@ class ClickerGame(QWidget):
         self._remove_orb()
 
         s = self.state
+        s["golden"] += 1
         now = time.monotonic()
+        extra = 5 * shop_level(s, "extender")
         roll = random.random()
         if roll < 0.5:
             # Cookie Clicker's "Lucky": 15% of bank or 15 min of production, whichever is smaller, +13
@@ -503,83 +673,135 @@ class ClickerGame(QWidget):
             self.event_text = f"LUCKY! +{fmt(gain)}"
             self.event_until = now + 4
         elif roll < 0.85:
-            self.buffs["frenzy"] = now + FRENZY_SECONDS
+            self.buffs["frenzy"] = now + FRENZY_SECONDS + extra
         else:
-            self.buffs["clickfrenzy"] = now + CLICK_FRENZY_SECONDS
+            self.buffs["clickfrenzy"] = now + CLICK_FRENZY_SECONDS + extra
         self._refresh()
         self._save()
 
+    # ---------- Functions (achievements) ----------
+
+    def _check_achievements(self, silent=False):
+        s = self.state
+        for aid, name, _desc, stat, threshold in ACHIEVEMENTS:
+            if aid not in s["ach"] and stat_value(s, stat) >= threshold:
+                s["ach"].append(aid)
+                if not silent:
+                    self.event_text = f"TROPHY: {name}"
+                    self.event_until = time.monotonic() + 4
+
     # ---------- Functions (UI refresh) ----------
+
+    def _set_buy_index(self, idx):
+        self.buy_index = idx
+        self.state["buy_mode"] = idx
+        for i, btn in enumerate(self.amount_btns):
+            btn.setChecked(i == idx)
+        self._refresh()
 
     def _refresh(self):
         s = self.state
-        mult = self._prod_mult()
-        rate = total_cps(s) * mult
-        clk = click_value(s) * self._click_mult()
+        now = time.monotonic()
+        rate = total_cps(s) * self._prod_mult()
+        clk = click_value(s) * self._click_mult() * self._combo_mult()
+        auto = shop_level(s, "autoclick") * AUTO_CLICKS_PER_LEVEL
 
         self.score_label.setText(f"{fmt(s['score'])} Bytes")
+        auto_text = f"  |  auto {auto:g}/s" if auto else ""
         self.rate_label.setText(
-            f"+{fmt(clk)} / click ({crit_chance(s) * 100:.0f}% crit)   |   +{fmt(rate)} / sec"
+            f"+{fmt(clk)} / click ({crit_chance(s) * 100:.0f}% crit){auto_text}   |   +{fmt(rate)} / sec"
         )
 
-        now = time.monotonic()
         parts = []
         if self.event_until > now:
             parts.append(self.event_text)
+        if self.combo >= 5:
+            parts.append(f"COMBO x{self.combo}")
         for name, label in (("frenzy", f"FRENZY x{FRENZY_MULT}"), ("clickfrenzy", f"CLICK FRENZY x{CLICK_FRENZY_MULT}")):
             left = self.buffs.get(name, 0) - now
             if left > 0:
                 parts.append(f"{label} {left:.0f}s")
         self.buff_label.setText("  |  ".join(parts))
 
+        points = s["prestige_points"]
         gain = prestige_gain_available(s)
-        needed = next_prestige_threshold(s)
-        pct = s["prestige_points"] * PRESTIGE_BONUS_PER_POINT * 100
+        lo, hi = prestige_threshold(points), prestige_threshold(points + 1)
+        pct = points * PRESTIGE_BONUS_PER_POINT * 100
         self.prestige_label.setText(
-            f"Prestige {s['prestige_points']} (+{pct:.0f}%)  |  next at {fmt(needed)} lifetime ({fmt(s['total_alltime'])})"
+            f"Prestige {points} (+{pct:.0f}%)  |  next at {fmt(hi)} lifetime ({fmt(s['total_alltime'])})"
         )
-        self.ascend_btn.setText(f"Ascend (+{gain})" if gain > 0 else "Ascend (keep earning)")
+        frac = 1.0 if gain > 0 else max(0.0, min(1.0, (s["total_alltime"] - lo) / max(1, hi - lo)))
+        self.prestige_bar.setValue(int(frac * 1000))
+        self.ascend_btn.setText(f"Ascend (+{gain})" if gain > 0 else "Ascend")
         self.ascend_btn.setEnabled(gain > 0)
 
         avail = points_available(s)
-        self.shop_btn.setText(f"Prestige Shop ({fmt(avail)} pts)")
+        self.shop_btn.setText(f"Shop ({fmt(avail)})")
         self.shop_points_label.setText(f"{fmt(avail)} points to spend")
         for item in SHOP:
             lvl = shop_level(s, item["id"])
             btn = self.shop_btns[item["id"]]
-            if item["max"] is not None and lvl >= item["max"]:
+            if lvl >= item["max"]:
                 btn.setText(f"{item['name']}  (Lv {lvl}/{item['max']})\n{item['desc']}  |  MAXED")
                 btn.setEnabled(False)
             else:
                 cost = shop_cost(item, lvl)
-                cap = f"/{item['max']}" if item["max"] is not None else ""
-                btn.setText(f"{item['name']}  (Lv {lvl}{cap})\n{item['desc']}  |  cost {fmt(cost)} pts")
+                btn.setText(f"{item['name']}  (Lv {lvl}/{item['max']})\n{item['desc']}  |  cost {fmt(cost)} pts")
                 btn.setEnabled(avail >= cost)
+
+        done = len(s["ach"])
+        self.trophy_btn.setText(f"Trophies {done}/{len(ACHIEVEMENTS)}")
+        self.trophy_header.setText(f"{done}/{len(ACHIEVEMENTS)} trophies  (+{done * ACHIEVEMENT_BONUS * 100:.0f}% production)")
+        self.stats_label.setText(
+            f"Clicks {fmt(s['clicks'])}   Crits {fmt(s['crits'])}   Golden orbs {fmt(s['golden'])}   "
+            f"Lifetime {fmt(s['total_alltime'])}"
+        )
+        for aid, name, desc, _stat, _thr in ACHIEVEMENTS:
+            got = aid in s["ach"]
+            self.ach_labels[aid].setText(f"{'[x]' if got else '[ ]'} {name}: {desc}")
+            self.ach_labels[aid].setStyleSheet("color: #3fb950;" if got else "color: #4d5560;")
 
         cost = click_upgrade_cost(s["click_level"])
         self.click_upgrade_btn.setText(f"Upgrade click power +1 (cost: {fmt(cost)})")
         self.click_upgrade_btn.setEnabled(s["score"] >= cost)
 
+        amount = BUY_AMOUNTS[self.buy_index]
         for b in BUILDINGS:
             owned = s["buildings"].get(b["id"], 0)
-            cost = building_cost(b, owned, s)
+            can_max = max_affordable(b, owned, s["score"], s)
+            n = max(1, can_max) if amount == "MAX" else amount
+            cost = bulk_cost(b, owned, n, s)
             each = b["cps"] * milestone_mult(owned) * prestige_multiplier(s)
             nxt = next_milestone(owned)
             tail = f"  |  x2 at {nxt}" if nxt else "  |  maxed"
             btn = self.building_btns[b["id"]]
-            btn.setText(f"{b['name']} ({owned})\ncost {fmt(cost)}  |  +{fmt(each)}/sec each{tail}")
+            btn.setText(f"{b['name']} ({owned})  +{n}\ncost {fmt(cost)}  |  +{fmt(each)}/sec each{tail}")
             btn.setEnabled(s["score"] >= cost)
+            mx = self.building_max[b["id"]]
+            mx.setText(f"MAX {can_max}" if can_max else "MAX")
+            mx.setEnabled(can_max >= 1)
 
     # ---------- Functions (actions) ----------
 
-    def on_click(self):
+    def _click_once(self, manual):
         s = self.state
         gain = click_value(s) * self._click_mult()
+        if manual:
+            gain *= self._combo_mult()
         crit = random.random() < crit_chance(s)
         if crit:
             gain *= crit_multiplier(s)
+            s["crits"] += 1
         s["score"] += gain
         s["total_alltime"] += gain
+        return gain, crit
+
+    def on_click(self):
+        now = time.monotonic()
+        self.combo = self.combo + 1 if now - self._last_click <= COMBO_WINDOW else 1
+        self._last_click = now
+        self.state["clicks"] += 1
+        gain, crit = self._click_once(True)
         if crit:
             self._float_text(f"CRIT! +{fmt(gain)}", (242, 204, 96), big=True)
         else:
@@ -590,13 +812,32 @@ class ClickerGame(QWidget):
         now = time.monotonic()
         dt = now - self._last_tick
         self._last_tick = now
+        s = self.state
 
-        gain = total_cps(self.state) * self._prod_mult() * dt
+        gain = total_cps(s) * self._prod_mult() * dt
         if gain:
-            self.state["score"] += gain
-            self.state["total_alltime"] += gain
+            s["score"] += gain
+            s["total_alltime"] += gain
+
+        level = shop_level(s, "autoclick")
+        if level:
+            self._auto_acc += level * AUTO_CLICKS_PER_LEVEL * dt
+            n = min(int(self._auto_acc), 60)
+            self._auto_acc -= int(self._auto_acc)
+            best = None
+            for _ in range(n):
+                value, crit = self._click_once(False)
+                if crit:
+                    best = value
+            if best is not None and self.stack.currentIndex() == 0:
+                self._float_text(f"AUTO CRIT! +{fmt(best)}", (242, 204, 96), big=True, pos=self._click_center())
+
+        if self.combo and now - self._last_click > COMBO_WINDOW:
+            self.combo = 0
 
         self._ticks += 1
+        if self._ticks % 4 == 0:
+            self._check_achievements()
         if self._ticks % SAVE_EVERY_TICKS == 0:
             self._save()
         self._refresh()
@@ -610,36 +851,46 @@ class ClickerGame(QWidget):
             self._refresh()
             self._save()
 
-    def buy_building(self, building_id):
+    def buy_building(self, building_id, amount):
+        s = self.state
         building = next(b for b in BUILDINGS if b["id"] == building_id)
-        owned = self.state["buildings"].get(building_id, 0)
-        cost = building_cost(building, owned, self.state)
-        if self.state["score"] >= cost:
-            self.state["score"] -= cost
-            self.state["buildings"][building_id] = owned + 1
+        owned = s["buildings"].get(building_id, 0)
+        n = max_affordable(building, owned, s["score"], s) if amount == "MAX" else amount
+        if n <= 0:
+            return
+        cost = bulk_cost(building, owned, n, s)
+        if s["score"] >= cost:
+            s["score"] -= cost
+            s["buildings"][building_id] = owned + n
+            self._check_achievements()
             self._refresh()
             self._save()
 
     def buy_shop(self, item_id):
         item = next(i for i in SHOP if i["id"] == item_id)
         lvl = shop_level(self.state, item_id)
-        if item["max"] is not None and lvl >= item["max"]:
+        if lvl >= item["max"]:
             return
         cost = shop_cost(item, lvl)
         if points_available(self.state) >= cost:
             self.state["prestige_spent"] += cost
             self.state["shop"][item_id] = lvl + 1
+            self._check_achievements()
             self._refresh()
             self._save()
 
     def ascend(self):
-        gain = prestige_gain_available(self.state)
+        s = self.state
+        gain = prestige_gain_available(s)
         if gain <= 0:
             return
-        self.state["prestige_points"] += gain
-        self.state["score"] = 0
-        self.state["buildings"] = {}
-        self.state["click_power"] = 1
-        self.state["click_level"] = 0
+        s["prestige_points"] += gain
+        s["score"] = 0
+        s["click_power"] = 1
+        s["click_level"] = 0
+        lvl = shop_level(s, "headstart")
+        s["buildings"] = {bid: count * lvl for bid, count in HEAD_START.items()} if lvl else {}
+        self.combo = 0
+        self._check_achievements()
         self._refresh()
         self._save()

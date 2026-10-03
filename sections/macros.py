@@ -269,6 +269,10 @@ class MacroEditor(QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._mouse_captured.connect(self._on_mouse_captured)
+        from core.input_hub import get_hub
+        self._hub = get_hub()
+        self._hub.captured.connect(self._on_hotkey_captured)
+        self.destroyed.connect(lambda *_, hub=self._hub: hub.end_capture())
 
         layout = QVBoxLayout(self)
 
@@ -464,10 +468,13 @@ class MacroEditor(QWidget):
     # ---------- Functions (hotkey capture, save) ----------
 
     def _start_hotkey_capture(self):
-        self._listening_hotkey = True
-        self._held_modifiers = []
-        self.hotkey_btn.setText("Press a key combo (Esc clears it)...")
-        self.setFocus()
+        self._hub.start()
+        self.hotkey_btn.setText("Press a key, combo or controller button (Esc clears)...")
+        self._hub.begin_capture()
+
+    def _on_hotkey_captured(self, combo):
+        self.hotkey = combo or None
+        self._update_hotkey_label()
 
     def _update_hotkey_label(self):
         self.hotkey_btn.setText(f"Hotkey: {self.hotkey} (click to change, Esc clears)" if self.hotkey else "Set hotkey (optional)")

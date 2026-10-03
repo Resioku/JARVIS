@@ -17,6 +17,7 @@ import mouse
 from PyQt6.QtCore import QThread
 
 from core.macro_store import load_macros
+from core.input_hub import get_hub
 
 log = logging.getLogger(__name__)
 
@@ -152,26 +153,18 @@ def stop_all():
 
 # ---------- Hotkeys ----------
 
-_registered_handlers = []   # tracked ourselves — unhook_all_hotkeys() is broken in some `keyboard` versions
+def _run_by_name(name):
+    for macro in load_macros():
+        if macro.get("name") == name:
+            trigger_macro(macro)
+            return
+    log.warning("Trigger fired for unknown macro '%s'", name)
 
 
 def register_hotkeys():
-    """Re-binds every macro's global hotkey. Call this after any macro is
-    added, edited, or deleted, and once at startup. Pressing a loop
-    macro's hotkey again stops it, same as the voice/UI toggle."""
-    global _registered_handlers
-    for handler in _registered_handlers:
-        try:
-            keyboard.remove_hotkey(handler)
-        except (KeyError, ValueError):
-            pass
-    _registered_handlers = []
-
-    for macro in load_macros():
-        hotkey = macro.get("hotkey")
-        if hotkey:
-            try:
-                handler = keyboard.add_hotkey(hotkey, lambda m=macro: trigger_macro(m))
-                _registered_handlers.append(handler)
-            except Exception:
-                log.exception("Couldn't bind hotkey '%s' for macro '%s'", hotkey, macro.get("name"))
+    """Re-binds every macro's trigger (keyboard keys or controller buttons).
+    Call after any macro is added, edited or deleted, and once at startup."""
+    hub = get_hub()
+    hub.on_macro = _run_by_name
+    hub.set_triggers([(m["hotkey"], m["name"]) for m in load_macros() if m.get("hotkey")])
+    hub.start()
